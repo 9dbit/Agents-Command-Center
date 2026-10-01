@@ -7,6 +7,7 @@ import {
 import './p03.css'
 import BrainWorkspace from './BrainView'
 import ToolsWorkspace from './ToolsView'
+import MissionsWorkspace from './MissionsView'
 
 type Agent = { id:string; name:string; role:string; status:'working'|'idle'|'waiting'|'approval'|'failed'; task?:string|null }
 type Department = { id:string; name:string; accent:string; agents:Agent[]; lead:string }
@@ -14,7 +15,7 @@ type Task = { id:string; title:string; department:string; status:string; owner:s
 type Approval = { id:string; title:string; status:string; requestedBy:string; decidedBy?:string|null; createdAt?:string; decidedAt?:string|null }
 type ActivityItem = { id:string; actor:string; action:string; targetType:string; targetId:string; detail?:string|null; createdAt?:string }
 type State = { departments:Department[]; tasks:Task[]; approvals:number; tools:{name:string;status:string}[]; persistence?:string }
-type View = 'department'|'hq'|'brain'|'approvals'|'tools'|'activity'
+type View = 'department'|'hq'|'missions'|'brain'|'approvals'|'tools'|'activity'
 
 const fallback: State = {
   departments: [
@@ -100,8 +101,15 @@ export default function App(){
 
   useEffect(()=>{
     const next=state.departments.find(d=>d.id===selected)
-    if(next) setMessages([{from:'lead',text:`${next.name} command channel online. I am coordinating ${next.agents.length} agents and durable work is connected to PostgreSQL.`}])
-  },[selected])
+    if(!next) return
+    let cancelled=false
+    fetch(`/api/chat/history/${selected}`).then(r=>r.ok?r.json():Promise.reject()).then((rows:any[])=>{
+      if(cancelled) return
+      if(rows.length) setMessages(rows.map(row=>({from:row.role==='user'?'user':'lead',text:row.content})))
+      else setMessages([{from:'lead',text:`${next.name} command channel online. I am coordinating ${next.agents.length} agents and durable work is connected to PostgreSQL.`}])
+    }).catch(()=>{if(!cancelled)setMessages([{from:'lead',text:`${next.name} command channel online. Durable chat history is temporarily unavailable.`}])})
+    return()=>{cancelled=true}
+  },[selected,state.departments.length])
 
   const send=async(delegate=false)=>{
     if(!prompt.trim() || !dept) return
@@ -156,8 +164,8 @@ export default function App(){
     }finally{setBusy(false)}
   }
 
-  const title=view==='hq'?'Headquarters':view==='brain'?'Organization Brain':view==='approvals'?'Approval Inbox':view==='tools'?'Tool Connections':view==='activity'?'Activity Log':`${dept?.name ?? 'Department'} Department`
-  const subtitle=view==='hq'?'Organization command view':view==='brain'?'Durable knowledge, SOPs, decisions and rules':view==='approvals'?'Human control point for sensitive work':view==='tools'?'Live execution connectors and controlled sync':view==='activity'?'Auditable execution history':`${dept?.agents.length ?? 0} agents coordinated by ${dept?.lead ?? 'Lead'}`
+  const title=view==='hq'?'Headquarters':view==='missions'?'Missions':view==='brain'?'Organization Brain':view==='approvals'?'Approval Inbox':view==='tools'?'Tool Connections':view==='activity'?'Activity Log':`${dept?.name ?? 'Department'} Department`
+  const subtitle=view==='hq'?'Organization command view':view==='missions'?'Cross-department outcomes and durable workstreams':view==='brain'?'Durable knowledge, SOPs, decisions and rules':view==='approvals'?'Human control point for sensitive work':view==='tools'?'Live execution connectors and controlled sync':view==='activity'?'Auditable execution history':`${dept?.agents.length ?? 0} agents coordinated by ${dept?.lead ?? 'Lead'}`
 
   return <div className="app-shell">
     <aside className="sidebar">
@@ -165,12 +173,12 @@ export default function App(){
       <nav>
         <button className={view==='hq'?'active':''} onClick={()=>setView('hq')}><LayoutDashboard/>HQ Overview</button>
         <button className={view==='department'?'active':''} onClick={()=>setView('department')}><Network/>Departments</button>
-        <button><GitBranch/>Missions</button><button className={view==='brain'?'active':''} onClick={()=>setView('brain')}><Brain/>Brain</button>
+        <button className={view==='missions'?'active':''} onClick={()=>setView('missions')}><GitBranch/>Missions</button><button className={view==='brain'?'active':''} onClick={()=>setView('brain')}><Brain/>Brain</button>
         <button className={view==='approvals'?'active':''} onClick={()=>setView('approvals')}><ShieldCheck/>Approvals <em>{state.approvals}</em></button>
         <button className={view==='tools'?'active':''} onClick={()=>setView('tools')}><Wrench/>Tools</button>
         <button className={view==='activity'?'active':''} onClick={()=>setView('activity')}><Activity/>Activity</button>
       </nav>
-      <div className="sidebar-bottom"><button><Settings/>Settings</button><div className="system-live"><i/> System live <span>v0.5</span></div></div>
+      <div className="sidebar-bottom"><button><Settings/>Settings</button><div className="system-live"><i/> System live <span>v0.6</span></div></div>
     </aside>
 
     <main>
@@ -185,6 +193,7 @@ export default function App(){
         </div>
       </header>
 
+      {view==='missions' && <MissionsWorkspace departments={state.departments}/>} 
       {view==='hq' && <HQ state={state} onOpen={(id)=>{setSelected(id);setView('department')}} onApprovals={()=>setView('approvals')}/>} 
       {view==='brain' && <BrainWorkspace departments={state.departments}/>} 
       {view==='tools' && <ToolsWorkspace/>} 
