@@ -5,6 +5,7 @@ import {
   Search, Send, Settings, ShieldCheck, Sparkles, Trash2, Users, Wrench, X
 } from 'lucide-react'
 import './p03.css'
+import BrainWorkspace from './BrainView'
 
 type Agent = { id:string; name:string; role:string; status:'working'|'idle'|'waiting'|'approval'|'failed'; task?:string|null }
 type Department = { id:string; name:string; accent:string; agents:Agent[]; lead:string }
@@ -12,7 +13,7 @@ type Task = { id:string; title:string; department:string; status:string; owner:s
 type Approval = { id:string; title:string; status:string; requestedBy:string; decidedBy?:string|null; createdAt?:string; decidedAt?:string|null }
 type ActivityItem = { id:string; actor:string; action:string; targetType:string; targetId:string; detail?:string|null; createdAt?:string }
 type State = { departments:Department[]; tasks:Task[]; approvals:number; tools:{name:string;status:string}[]; persistence?:string }
-type View = 'department'|'hq'|'approvals'|'activity'
+type View = 'department'|'hq'|'brain'|'approvals'|'activity'
 
 const fallback: State = {
   departments: [
@@ -155,8 +156,8 @@ export default function App(){
     }finally{setBusy(false)}
   }
 
-  const title=view==='hq'?'Headquarters':view==='approvals'?'Approval Inbox':view==='activity'?'Activity Log':`${dept?.name ?? 'Department'} Department`
-  const subtitle=view==='hq'?'Organization command view':view==='approvals'?'Human control point for sensitive work':view==='activity'?'Auditable execution history':`${dept?.agents.length ?? 0} agents coordinated by ${dept?.lead ?? 'Lead'}`
+  const title=view==='hq'?'Headquarters':view==='brain'?'Organization Brain':view==='approvals'?'Approval Inbox':view==='activity'?'Activity Log':`${dept?.name ?? 'Department'} Department`
+  const subtitle=view==='hq'?'Organization command view':view==='brain'?'Durable knowledge, SOPs, decisions and rules':view==='approvals'?'Human control point for sensitive work':view==='activity'?'Auditable execution history':`${dept?.agents.length ?? 0} agents coordinated by ${dept?.lead ?? 'Lead'}`
 
   return <div className="app-shell">
     <aside className="sidebar">
@@ -164,7 +165,7 @@ export default function App(){
       <nav>
         <button className={view==='hq'?'active':''} onClick={()=>setView('hq')}><LayoutDashboard/>HQ Overview</button>
         <button className={view==='department'?'active':''} onClick={()=>setView('department')}><Network/>Departments</button>
-        <button><GitBranch/>Missions</button><button><Brain/>Brain</button>
+        <button><GitBranch/>Missions</button><button className={view==='brain'?'active':''} onClick={()=>setView('brain')}><Brain/>Brain</button>
         <button className={view==='approvals'?'active':''} onClick={()=>setView('approvals')}><ShieldCheck/>Approvals <em>{state.approvals}</em></button>
         <button><Wrench/>Tools</button>
         <button className={view==='activity'?'active':''} onClick={()=>setView('activity')}><Activity/>Activity</button>
@@ -185,6 +186,7 @@ export default function App(){
       </header>
 
       {view==='hq' && <HQ state={state} onOpen={(id)=>{setSelected(id);setView('department')}} onApprovals={()=>setView('approvals')}/>} 
+      {view==='brain' && <BrainWorkspace departments={state.departments}/>} 
       {view==='approvals' && <ApprovalsView approvals={approvals} busy={busy} onDecision={decideApproval}/>} 
       {view==='activity' && <ActivityView activity={activity}/>} 
       {view==='department' && dept && <>
