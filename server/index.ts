@@ -8,6 +8,7 @@ import {
   tasks as tasksTable
 } from './db.js'
 import { getModelStatus, routeModel } from './modelRouter.js'
+import { fetchGitHubSnapshot, getToolStatus } from './toolRouter.js'
 
 const app = express()
 const port = Number(process.env.PORT || 3000)
@@ -109,10 +110,43 @@ async function getBrainContext(departmentId:string) {
 
 app.get('/api/health', async (_req,res)=>{
   const database = databaseReady ? 'connected' : (process.env.DATABASE_URL ? 'degraded' : 'not-configured')
-  res.json({ok:true,service:'agents-command-center',version:'0.4.0',database,databaseError,persistence:databaseReady?'postgres':'memory',model:getModelStatus()})
+  res.json({ok:true,service:'agents-command-center',version:'0.5.0',database,databaseError,persistence:databaseReady?'postgres':'memory',model:getModelStatus()})
 })
 
 app.get('/api/model/status',(_req,res)=>res.json(getModelStatus()))
+
+app.get('/api/tools/status',(_req,res)=>res.json(getToolStatus()))
+
+app.get('/api/tools/github', async (_req,res)=>{
+  try { res.json(await fetchGitHubSnapshot()) }
+  catch(error) { res.status(502).json({error:error instanceof Error?error.message:'github_connector_error'}) }
+})
+
+app.post('/api/tools/github/sync', async (_req,res)=>{
+  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  try {
+    const snapshot=await fetchGitHubSnapshot()
+    const source=`github:${snapshot.repository}`
+    const content=[
+      `Repository: ${snapshot.fullName}`,
+      `Description: ${snapshot.description || 'No description'}`,
+      `Visibility: ${snapshot.visibility}`,
+      `Default branch: ${snapshot.defaultBranch}`,
+      `Updated: ${snapshot.updatedAt}`,
+      'Recent commits:',
+      ...snapshot.commits.map(c=>`- ${c.sha.slice(0,7)} ${c.message} (${c.author})`)
+    ].join('\n')
+    const existing=await db.select().from(knowledgeItems).where(eq(knowledgeItems.source,source)).limit(1)
+    let item
+    if(existing[0]) {
+      ;[item]=await db.update(knowledgeItems).set({title:`GitHub repository: ${snapshot.fullName}`,content,updatedAt:new Date()}).where(eq(knowledgeItems.id,existing[0].id)).returning()
+    } else {
+      ;[item]=await db.insert(knowledgeItems).values({type:'project',title:`GitHub repository: ${snapshot.fullName}`,content,scope:'organization',source}).returning()
+    }
+    await db.insert(activityLogs).values({actor:'GitHub Connector',action:'tool.synced',targetType:'knowledge',targetId:item.id,detail:snapshot.repository})
+    res.json({ok:true,item,snapshot})
+  } catch(error) { res.status(502).json({error:error instanceof Error?error.message:'github_sync_error'}) }
+})
 
 app.get('/api/state', async (_req,res)=>{
   try { res.json(await readState()) } catch (error) { res.status(500).json({error:error instanceof Error?error.message:'state_error'}) }
