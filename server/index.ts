@@ -2,11 +2,16 @@ import express from 'express'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { desc, eq } from 'drizzle-orm'
-import { activityLogs, agents as agentsTable, approvals as approvalsTable, departments as departmentsTable, ensureSchema, getDb, tasks as tasksTable } from './db.js'
+import {
+  activityLogs, agents as agentsTable, approvals as approvalsTable, conversations,
+  departments as departmentsTable, ensureSchema, getDb, knowledgeItems, messages,
+  tasks as tasksTable
+} from './db.js'
+import { getModelStatus, routeModel } from './modelRouter.js'
 
 const app = express()
 const port = Number(process.env.PORT || 3000)
-app.use(express.json())
+app.use(express.json({limit:'1mb'}))
 
 let databaseReady = false
 let databaseError: string | null = null
@@ -55,7 +60,7 @@ async function seedIfNeeded() {
 
 async function readState() {
   const db = readyDb()
-  if (!db) return { departments: seedDepartments, tasks: seedTasks, approvals: 3, tools, persistence:'memory', databaseError }
+  if (!db) return { departments: seedDepartments, tasks: seedTasks, approvals: 3, tools, persistence:'memory', databaseError, model:getModelStatus() }
   try {
     const [departmentRows, agentRows, taskRows, approvalRows] = await Promise.all([
       db.select().from(departmentsTable),
@@ -64,19 +69,50 @@ async function readState() {
       db.select().from(approvalsTable)
     ])
     const departments = departmentRows.map(d => ({...d, agents:agentRows.filter(a => a.departmentId===d.id).map(({departmentId, ...a})=>a)}))
-    return {departments,tasks:taskRows.map(({createdAt,updatedAt,...t})=>t),approvals:approvalRows.filter(a=>a.status==='pending').length,tools,persistence:'postgres'}
+    return {departments,tasks:taskRows.map(({createdAt,updatedAt,...t})=>t),approvals:approvalRows.filter(a=>a.status==='pending').length,tools,persistence:'postgres',model:getModelStatus()}
   } catch (error) {
     databaseReady = false
     databaseError = error instanceof Error ? error.message : 'database_error'
     console.error('Database read failed, switching to memory mode:', databaseError)
-    return { departments: seedDepartments, tasks: seedTasks, approvals: 3, tools, persistence:'memory', databaseError }
+    return { departments: seedDepartments, tasks: seedTasks, approvals: 3, tools, persistence:'memory', databaseError, model:getModelStatus() }
   }
+}
+
+async function getConversation(departmentId:string, lead:string) {
+  const db=readyDb()
+  if(!db) return null
+  const rows=await db.select().from(conversations).where(eq(conversations.departmentId,departmentId)).orderBy(desc(conversations.updatedAt)).limit(1)
+  if(rows[0]) return rows[0]
+  const [created]=await db.insert(conversations).values({departmentId,lead}).returning()
+  return created
+}
+
+async function writeMessage(departmentId:string, lead:string, role:string, content:string, provider?:string|null, model?:string|null) {
+  const db=readyDb()
+  if(!db) return
+  const conversation=await getConversation(departmentId,lead)
+  if(!conversation) return
+  await db.insert(messages).values({conversationId:conversation.id,role,content,provider:provider||null,model:model||null})
+  await db.update(conversations).set({updatedAt:new Date()}).where(eq(conversations.id,conversation.id))
+}
+
+async function getBrainContext(departmentId:string) {
+  const db=readyDb()
+  if(!db) return ''
+  const rows=await db.select().from(knowledgeItems).orderBy(desc(knowledgeItems.updatedAt)).limit(50)
+  return rows
+    .filter(item=>item.scope==='organization' || item.departmentId===departmentId)
+    .slice(0,20)
+    .map(item=>`[${item.type}] ${item.title}: ${item.content}`)
+    .join('\n')
 }
 
 app.get('/api/health', async (_req,res)=>{
   const database = databaseReady ? 'connected' : (process.env.DATABASE_URL ? 'degraded' : 'not-configured')
-  res.json({ok:true,service:'agents-command-center',version:'0.3.0',database,databaseError,persistence:databaseReady?'postgres':'memory'})
+  res.json({ok:true,service:'agents-command-center',version:'0.4.0',database,databaseError,persistence:databaseReady?'postgres':'memory',model:getModelStatus()})
 })
+
+app.get('/api/model/status',(_req,res)=>res.json(getModelStatus()))
 
 app.get('/api/state', async (_req,res)=>{
   try { res.json(await readState()) } catch (error) { res.status(500).json({error:error instanceof Error?error.message:'state_error'}) }
@@ -138,40 +174,111 @@ app.get('/api/activity', async (_req,res)=>{
   res.json(await db.select().from(activityLogs).orderBy(desc(activityLogs.createdAt)).limit(100))
 })
 
+app.get('/api/brain', async (req,res)=>{
+  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  let rows=await db.select().from(knowledgeItems).orderBy(desc(knowledgeItems.updatedAt)).limit(250)
+  const department=String(req.query.department || '')
+  const type=String(req.query.type || '')
+  if(department) rows=rows.filter(item=>item.scope==='organization' || item.departmentId===department)
+  if(type) rows=rows.filter(item=>item.type===type)
+  res.json(rows)
+})
+
+app.post('/api/brain', async (req,res)=>{
+  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  const title=String(req.body?.title || '').trim().slice(0,180)
+  const content=String(req.body?.content || '').trim().slice(0,20000)
+  if(!title || !content) return res.status(400).json({error:'title_and_content_required'})
+  const item={
+    type:String(req.body?.type || 'knowledge').slice(0,60),
+    title,
+    content,
+    scope:String(req.body?.scope || 'organization').slice(0,60),
+    departmentId:req.body?.departmentId ? String(req.body.departmentId).slice(0,80) : null,
+    source:String(req.body?.source || 'manual').slice(0,120)
+  }
+  const [created]=await db.insert(knowledgeItems).values(item).returning()
+  await db.insert(activityLogs).values({actor:'You',action:'brain.created',targetType:'knowledge',targetId:created.id,detail:created.title})
+  res.status(201).json(created)
+})
+
+app.patch('/api/brain/:id', async (req,res)=>{
+  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  const patch:any={updatedAt:new Date()}
+  for(const key of ['type','title','content','scope','source']) if(req.body?.[key]!==undefined) patch[key]=String(req.body[key])
+  if(req.body?.departmentId!==undefined) patch.departmentId=req.body.departmentId ? String(req.body.departmentId) : null
+  const [updated]=await db.update(knowledgeItems).set(patch).where(eq(knowledgeItems.id,req.params.id)).returning()
+  if(!updated) return res.status(404).json({error:'knowledge_not_found'})
+  await db.insert(activityLogs).values({actor:'You',action:'brain.updated',targetType:'knowledge',targetId:updated.id,detail:updated.title})
+  res.json(updated)
+})
+
+app.delete('/api/brain/:id', async (req,res)=>{
+  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  const [deleted]=await db.delete(knowledgeItems).where(eq(knowledgeItems.id,req.params.id)).returning()
+  if(!deleted) return res.status(404).json({error:'knowledge_not_found'})
+  await db.insert(activityLogs).values({actor:'You',action:'brain.deleted',targetType:'knowledge',targetId:deleted.id,detail:deleted.title})
+  res.json({ok:true,id:deleted.id})
+})
+
+app.get('/api/chat/history/:department', async (req,res)=>{
+  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  const rows=await db.select().from(conversations).where(eq(conversations.departmentId,req.params.department)).orderBy(desc(conversations.updatedAt)).limit(1)
+  if(!rows[0]) return res.json([])
+  res.json(await db.select().from(messages).where(eq(messages.conversationId,rows[0].id)).orderBy(messages.createdAt).limit(200))
+})
+
 app.post('/api/chat', async (req,res)=>{
   const state=await readState()
   const dept=state.departments.find(d=>d.id===req.body?.department)
+  const departmentId=dept?.id ?? String(req.body?.department || 'organization')
+  const departmentName=dept?.name ?? 'Organization'
   const lead=dept?.lead ?? 'Command Lead'
   const message=String(req.body?.message || '').trim()
+  if(!message) return res.status(400).json({error:'message_required'})
   const lower=message.toLowerCase()
   const persistence = state.persistence === 'postgres' ? 'Persistence is live.' : 'Database is temporarily degraded, so I am operating in memory mode.'
 
-  if (req.body?.delegate === true && message) {
+  await writeMessage(departmentId,lead,'user',message)
+
+  if (req.body?.delegate === true) {
     const db=readyDb()
     if (!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
-    const task={
-      id:`t-delegated-${Date.now()}`,
-      title:message.slice(0,180),
-      department:dept?.name ?? 'Marketing',
-      status:'Inbox',
-      owner:lead,
-      priority:'Medium'
-    }
+    const task={id:`t-delegated-${Date.now()}`,title:message.slice(0,180),department:departmentName,status:'Inbox',owner:lead,priority:'Medium'}
     await db.insert(tasksTable).values(task)
     await db.insert(activityLogs).values({actor:lead,action:'lead.delegated',targetType:'task',targetId:task.id,detail:task.title})
-    return res.status(201).json({reply:`${lead}: Delegated. I created a durable Inbox task and assigned ownership to myself for triage.`,task})
+    const reply=`${lead}: Delegated. I created a durable Inbox task and assigned ownership to myself for triage.`
+    await writeMessage(departmentId,lead,'assistant',reply,'orchestrator','durable-delegation')
+    return res.status(201).json({reply,task,provider:'orchestrator'})
   }
 
-  let reply=`${lead}: Command received. ${persistence} Model routing is the next intelligence layer; durable work operations are already online.`
+  const deptTasks=state.tasks.filter(t=>t.department===departmentName)
+  const taskContext=deptTasks.map(t=>`${t.status} | ${t.priority} | ${t.owner} | ${t.title}`).join('\n')
+  const brainContext=await getBrainContext(departmentId)
+
+  try {
+    const routed=await routeModel({lead,department:departmentName,message,context:taskContext,knowledge:brainContext})
+    if(routed) {
+      await writeMessage(departmentId,lead,'assistant',routed.text,routed.provider,routed.model)
+      return res.json({reply:routed.text,provider:routed.provider,model:routed.model})
+    }
+  } catch(error) {
+    const db=readyDb()
+    const detail=error instanceof Error ? error.message : 'model_router_error'
+    if(db) await db.insert(activityLogs).values({actor:'Model Router',action:'model.failed',targetType:'department',targetId:departmentId,detail:detail.slice(0,500)})
+    console.error('Model router failed, using deterministic fallback:', detail)
+  }
+
+  let reply=`${lead}: Command received. ${persistence} The model adapter is not configured yet, so I am using deterministic orchestration.`
   if(lower.includes('block')) {
     const blocked=state.tasks.filter(t=>t.status==='Waiting' || t.status==='Approval')
     reply=`${lead}: ${blocked.length} task${blocked.length===1?' is':'s are'} currently blocked by Waiting or Approval. Persistence mode is ${state.persistence}.`
   }
   if(lower.includes('summar')) {
-    const deptTasks=state.tasks.filter(t=>t.department===dept?.name)
-    reply=`${lead}: ${deptTasks.length} durable task${deptTasks.length===1?'':'s'} in ${dept?.name ?? 'this department'}, with ${deptTasks.filter(t=>t.status==='Running').length} running and ${deptTasks.filter(t=>t.status==='Approval').length} awaiting approval. Persistence mode is ${state.persistence}.`
+    reply=`${lead}: ${deptTasks.length} durable task${deptTasks.length===1?'':'s'} in ${departmentName}, with ${deptTasks.filter(t=>t.status==='Running').length} running and ${deptTasks.filter(t=>t.status==='Approval').length} awaiting approval. Persistence mode is ${state.persistence}.`
   }
-  res.json({reply})
+  await writeMessage(departmentId,lead,'assistant',reply,'local','deterministic-orchestrator')
+  res.json({reply,provider:'local',model:'deterministic-orchestrator'})
 })
 
 async function boot() {
@@ -191,7 +298,7 @@ async function boot() {
   const dist=path.resolve(__dirname,'../dist')
   app.use(express.static(dist))
   app.get('/*splat',(_req,res)=>res.sendFile(path.join(dist,'index.html')))
-  app.listen(port,'0.0.0.0',()=>console.log(`Agents Command Center listening on :${port} | persistence=${databaseReady?'postgres':'memory'}`))
+  app.listen(port,'0.0.0.0',()=>console.log(`Agents Command Center listening on :${port} | persistence=${databaseReady?'postgres':'memory'} | model=${getModelStatus().configured?'configured':'fallback'}`))
 }
 
 boot().catch(error=>{ console.error('Fatal boot failure',error); process.exit(1) })
