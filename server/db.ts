@@ -49,6 +49,36 @@ export const activityLogs = pgTable('activity_logs', {
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 })
 
+export const knowledgeItems = pgTable('knowledge_items', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  type: text('type').notNull().default('knowledge'),
+  title: text('title').notNull(),
+  content: text('content').notNull(),
+  scope: text('scope').notNull().default('organization'),
+  departmentId: text('department_id'),
+  source: text('source').notNull().default('manual'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+})
+
+export const conversations = pgTable('conversations', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  departmentId: text('department_id').notNull(),
+  lead: text('lead').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+})
+
+export const messages = pgTable('messages', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  conversationId: uuid('conversation_id').notNull(),
+  role: text('role').notNull(),
+  content: text('content').notNull(),
+  provider: text('provider'),
+  model: text('model'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+})
+
 export type Database = ReturnType<typeof drizzle>
 
 let pool: Pool | null = null
@@ -113,6 +143,37 @@ export async function ensureSchema() {
       detail text,
       created_at timestamptz not null default now()
     );
+    create table if not exists knowledge_items (
+      id uuid primary key default gen_random_uuid(),
+      type text not null default 'knowledge',
+      title text not null,
+      content text not null,
+      scope text not null default 'organization',
+      department_id text,
+      source text not null default 'manual',
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+    create table if not exists conversations (
+      id uuid primary key default gen_random_uuid(),
+      department_id text not null,
+      lead text not null,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+    create table if not exists messages (
+      id uuid primary key default gen_random_uuid(),
+      conversation_id uuid not null references conversations(id) on delete cascade,
+      role text not null,
+      content text not null,
+      provider text,
+      model text,
+      created_at timestamptz not null default now()
+    );
+    create index if not exists knowledge_items_department_idx on knowledge_items(department_id);
+    create index if not exists knowledge_items_type_idx on knowledge_items(type);
+    create index if not exists conversations_department_idx on conversations(department_id, updated_at desc);
+    create index if not exists messages_conversation_idx on messages(conversation_id, created_at asc);
   `)
   return true
 }
