@@ -14,7 +14,7 @@ type ModelResult = {
 
 export function getModelStatus() {
   const provider = process.env.MODEL_PROVIDER || 'openai'
-  const model = process.env.OPENAI_MODEL || 'gpt-6-astra'
+  const model = process.env.OPENAI_MODEL || 'gpt-6-sol'
   const configured = provider === 'openai' && Boolean(process.env.OPENAI_API_KEY)
   return { provider, model, configured }
 }
