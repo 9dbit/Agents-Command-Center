@@ -3,7 +3,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { desc, eq } from 'drizzle-orm'
 import {
-  activityLogs, agents as agentsTable, approvals as approvalsTable, conversations,
+  activityLogs, agentRuns, agents as agentsTable, approvals as approvalsTable, conversations,
   departments as departmentsTable, ensureSchema, getDb, knowledgeItems, messages, missions as missionsTable,
   tasks as tasksTable
 } from './db.js'
@@ -110,11 +110,10 @@ async function getBrainContext(departmentId:string) {
 
 app.get('/api/health', async (_req,res)=>{
   const database = databaseReady ? 'connected' : (process.env.DATABASE_URL ? 'degraded' : 'not-configured')
-  res.json({ok:true,service:'agents-command-center',version:'0.6.0',database,databaseError,persistence:databaseReady?'postgres':'memory',model:getModelStatus()})
+  res.json({ok:true,service:'agents-command-center',version:'0.7.0',database,databaseError,persistence:databaseReady?'postgres':'memory',model:getModelStatus()})
 })
 
 app.get('/api/model/status',(_req,res)=>res.json(getModelStatus()))
-
 app.get('/api/tools/status',(_req,res)=>res.json(getToolStatus()))
 
 app.get('/api/tools/github', async (_req,res)=>{
@@ -127,25 +126,57 @@ app.post('/api/tools/github/sync', async (_req,res)=>{
   try {
     const snapshot=await fetchGitHubSnapshot()
     const source=`github:${snapshot.repository}`
-    const content=[
-      `Repository: ${snapshot.fullName}`,
-      `Description: ${snapshot.description || 'No description'}`,
-      `Visibility: ${snapshot.visibility}`,
-      `Default branch: ${snapshot.defaultBranch}`,
-      `Updated: ${snapshot.updatedAt}`,
-      'Recent commits:',
-      ...snapshot.commits.map(c=>`- ${c.sha.slice(0,7)} ${c.message} (${c.author})`)
-    ].join('\n')
+    const content=[`Repository: ${snapshot.fullName}`,`Description: ${snapshot.description || 'No description'}`,`Visibility: ${snapshot.visibility}`,`Default branch: ${snapshot.defaultBranch}`,`Updated: ${snapshot.updatedAt}`,'Recent commits:',...snapshot.commits.map(c=>`- ${c.sha.slice(0,7)} ${c.message} (${c.author})`)].join('\n')
     const existing=await db.select().from(knowledgeItems).where(eq(knowledgeItems.source,source)).limit(1)
     let item
-    if(existing[0]) {
-      ;[item]=await db.update(knowledgeItems).set({title:`GitHub repository: ${snapshot.fullName}`,content,updatedAt:new Date()}).where(eq(knowledgeItems.id,existing[0].id)).returning()
-    } else {
-      ;[item]=await db.insert(knowledgeItems).values({type:'project',title:`GitHub repository: ${snapshot.fullName}`,content,scope:'organization',source}).returning()
-    }
+    if(existing[0]) ;[item]=await db.update(knowledgeItems).set({title:`GitHub repository: ${snapshot.fullName}`,content,updatedAt:new Date()}).where(eq(knowledgeItems.id,existing[0].id)).returning()
+    else ;[item]=await db.insert(knowledgeItems).values({type:'project',title:`GitHub repository: ${snapshot.fullName}`,content,scope:'organization',source}).returning()
     await db.insert(activityLogs).values({actor:'GitHub Connector',action:'tool.synced',targetType:'knowledge',targetId:item.id,detail:snapshot.repository})
     res.json({ok:true,item,snapshot})
   } catch(error) { res.status(502).json({error:error instanceof Error?error.message:'github_sync_error'}) }
+})
+
+app.get('/api/runs', async (req,res)=>{
+  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  let rows=await db.select().from(agentRuns).orderBy(desc(agentRuns.createdAt)).limit(100)
+  const department=String(req.query.department||'')
+  const agent=String(req.query.agent||'')
+  if(department) rows=rows.filter(r=>r.departmentId===department)
+  if(agent) rows=rows.filter(r=>r.agentId===agent)
+  res.json(rows)
+})
+
+app.post('/api/runs', async (req,res)=>{
+  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  const agentId=String(req.body?.agentId||'').trim()
+  const departmentId=String(req.body?.departmentId||'').trim()
+  const skill=String(req.body?.skill||'').trim()
+  const input=String(req.body?.input||'').trim().slice(0,4000)
+  const taskId=req.body?.taskId?String(req.body.taskId):null
+  if(!agentId||!departmentId||!skill)return res.status(400).json({error:'agent_department_skill_required'})
+  const [agent]=await db.select().from(agentsTable).where(eq(agentsTable.id,agentId)).limit(1)
+  if(!agent||agent.departmentId!==departmentId)return res.status(404).json({error:'agent_not_found'})
+  if(skill!=='github.repo-audit')return res.status(400).json({error:'unsupported_skill'})
+  const [run]=await db.insert(agentRuns).values({agentId,departmentId,skill,status:'queued',input:input||null,taskId}).returning()
+  await db.update(agentRuns).set({status:'running',startedAt:new Date()}).where(eq(agentRuns.id,run.id))
+  await db.insert(activityLogs).values({actor:agent.name,action:'agent.run.started',targetType:'run',targetId:run.id,detail:skill})
+  try {
+    const snapshot=await fetchGitHubSnapshot()
+    const output=[`Repository ${snapshot.fullName} is ${snapshot.visibility} on ${snapshot.defaultBranch}.`,`${snapshot.commits.length} recent commits inspected; ${snapshot.openIssues} open issues reported by GitHub metadata.`,`Latest repository update: ${snapshot.updatedAt}.`,snapshot.commits[0]?`Latest commit: ${snapshot.commits[0].sha.slice(0,7)} ${snapshot.commits[0].message}.`:'No recent commit metadata returned.'].join(' ')
+    const source=`skill:github.repo-audit:${snapshot.repository}`
+    const existing=await db.select().from(knowledgeItems).where(eq(knowledgeItems.source,source)).limit(1)
+    if(existing[0]) await db.update(knowledgeItems).set({title:`Repository audit: ${snapshot.fullName}`,content:output,updatedAt:new Date()}).where(eq(knowledgeItems.id,existing[0].id))
+    else await db.insert(knowledgeItems).values({type:'analysis',title:`Repository audit: ${snapshot.fullName}`,content:output,scope:'organization',source})
+    if(taskId) await db.update(tasksTable).set({status:'Done',updatedAt:new Date()}).where(eq(tasksTable.id,taskId))
+    const [completed]=await db.update(agentRuns).set({status:'completed',output,completedAt:new Date()}).where(eq(agentRuns.id,run.id)).returning()
+    await db.insert(activityLogs).values({actor:agent.name,action:'agent.run.completed',targetType:'run',targetId:run.id,detail:skill})
+    return res.status(201).json(completed)
+  } catch(error) {
+    const detail=error instanceof Error?error.message:'skill_execution_failed'
+    const [failed]=await db.update(agentRuns).set({status:'failed',output:detail.slice(0,1000),completedAt:new Date()}).where(eq(agentRuns.id,run.id)).returning()
+    await db.insert(activityLogs).values({actor:agent.name,action:'agent.run.failed',targetType:'run',targetId:run.id,detail:detail.slice(0,500)})
+    return res.status(502).json(failed)
+  }
 })
 
 app.get('/api/missions', async (_req,res)=>{
@@ -181,191 +212,49 @@ app.patch('/api/missions/:id', async (req,res)=>{
   res.json({...updated,departmentIds:JSON.parse(updated.departmentIds||'[]')})
 })
 
-app.get('/api/state', async (_req,res)=>{
-  try { res.json(await readState()) } catch (error) { res.status(500).json({error:error instanceof Error?error.message:'state_error'}) }
-})
+app.get('/api/state', async (_req,res)=>{ try { res.json(await readState()) } catch(error) { res.status(500).json({error:error instanceof Error?error.message:'state_error'}) } })
 
 app.post('/api/tasks', async (req,res)=>{
-  const task={
-    id:String(req.body?.id || `t-${Date.now()}`),
-    title:String(req.body?.title || 'Untitled task').trim().slice(0,180),
-    department:String(req.body?.department || 'Marketing'),
-    status:String(req.body?.status || 'Inbox'),
-    owner:String(req.body?.owner || 'Unassigned'),
-    priority:String(req.body?.priority || 'Medium')
-  }
-  const db=readyDb()
-  if (!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
-  await db.insert(tasksTable).values(task)
-  await db.insert(activityLogs).values({actor:'You',action:'task.created',targetType:'task',targetId:task.id,detail:task.title})
-  res.status(201).json(task)
+  const task={id:String(req.body?.id || `t-${Date.now()}`),title:String(req.body?.title || 'Untitled task').trim().slice(0,180),department:String(req.body?.department || 'Marketing'),status:String(req.body?.status || 'Inbox'),owner:String(req.body?.owner || 'Unassigned'),priority:String(req.body?.priority || 'Medium')}
+  const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  await db.insert(tasksTable).values(task); await db.insert(activityLogs).values({actor:'You',action:'task.created',targetType:'task',targetId:task.id,detail:task.title}); res.status(201).json(task)
 })
 
 app.patch('/api/tasks/:id', async (req,res)=>{
-  const db=readyDb()
-  if (!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
-  const patch:any={updatedAt:new Date()}
-  for (const key of ['title','department','status','owner','priority']) if (req.body?.[key]!==undefined) patch[key]=String(req.body[key])
-  const [updated]=await db.update(tasksTable).set(patch).where(eq(tasksTable.id,req.params.id)).returning()
-  if (!updated) return res.status(404).json({error:'task_not_found'})
-  await db.insert(activityLogs).values({actor:'You',action:'task.updated',targetType:'task',targetId:req.params.id,detail:JSON.stringify(patch)})
-  res.json(updated)
+  const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  const patch:any={updatedAt:new Date()}; for(const key of ['title','department','status','owner','priority'])if(req.body?.[key]!==undefined)patch[key]=String(req.body[key])
+  const [updated]=await db.update(tasksTable).set(patch).where(eq(tasksTable.id,req.params.id)).returning(); if(!updated)return res.status(404).json({error:'task_not_found'})
+  await db.insert(activityLogs).values({actor:'You',action:'task.updated',targetType:'task',targetId:req.params.id,detail:JSON.stringify(patch)}); res.json(updated)
 })
 
-app.delete('/api/tasks/:id', async (req,res)=>{
-  const db=readyDb()
-  if (!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
-  const [deleted]=await db.delete(tasksTable).where(eq(tasksTable.id,req.params.id)).returning()
-  if (!deleted) return res.status(404).json({error:'task_not_found'})
-  await db.insert(activityLogs).values({actor:'You',action:'task.deleted',targetType:'task',targetId:req.params.id,detail:deleted.title})
-  res.json({ok:true,id:req.params.id})
-})
-
-app.get('/api/approvals', async (_req,res)=>{
-  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
-  res.json(await db.select().from(approvalsTable).orderBy(desc(approvalsTable.createdAt)))
-})
-
-app.patch('/api/approvals/:id', async (req,res)=>{
-  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
-  const status=String(req.body?.status || '')
-  if(!['approved','rejected','pending'].includes(status)) return res.status(400).json({error:'invalid_status'})
-  const [updated]=await db.update(approvalsTable).set({status,decidedBy:status==='pending'?null:'You',decidedAt:status==='pending'?null:new Date()}).where(eq(approvalsTable.id,req.params.id)).returning()
-  if(!updated) return res.status(404).json({error:'approval_not_found'})
-  await db.insert(activityLogs).values({actor:'You',action:`approval.${status}`,targetType:'approval',targetId:req.params.id,detail:updated.title})
-  res.json(updated)
-})
-
-app.get('/api/activity', async (_req,res)=>{
-  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
-  res.json(await db.select().from(activityLogs).orderBy(desc(activityLogs.createdAt)).limit(100))
-})
+app.delete('/api/tasks/:id', async (req,res)=>{ const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'}); const [deleted]=await db.delete(tasksTable).where(eq(tasksTable.id,req.params.id)).returning(); if(!deleted)return res.status(404).json({error:'task_not_found'}); await db.insert(activityLogs).values({actor:'You',action:'task.deleted',targetType:'task',targetId:req.params.id,detail:deleted.title}); res.json({ok:true,id:req.params.id}) })
+app.get('/api/approvals', async (_req,res)=>{ const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'}); res.json(await db.select().from(approvalsTable).orderBy(desc(approvalsTable.createdAt))) })
+app.patch('/api/approvals/:id', async (req,res)=>{ const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'}); const status=String(req.body?.status||''); if(!['approved','rejected','pending'].includes(status))return res.status(400).json({error:'invalid_status'}); const [updated]=await db.update(approvalsTable).set({status,decidedBy:status==='pending'?null:'You',decidedAt:status==='pending'?null:new Date()}).where(eq(approvalsTable.id,req.params.id)).returning(); if(!updated)return res.status(404).json({error:'approval_not_found'}); await db.insert(activityLogs).values({actor:'You',action:`approval.${status}`,targetType:'approval',targetId:req.params.id,detail:updated.title}); res.json(updated) })
+app.get('/api/activity', async (_req,res)=>{ const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'}); res.json(await db.select().from(activityLogs).orderBy(desc(activityLogs.createdAt)).limit(100)) })
 
 app.get('/api/brain', async (req,res)=>{
-  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
-  let rows=await db.select().from(knowledgeItems).orderBy(desc(knowledgeItems.updatedAt)).limit(250)
-  const department=String(req.query.department || '')
-  const type=String(req.query.type || '')
-  if(department) rows=rows.filter(item=>item.scope==='organization' || item.departmentId===department)
-  if(type) rows=rows.filter(item=>item.type===type)
-  res.json(rows)
+  const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  let rows=await db.select().from(knowledgeItems).orderBy(desc(knowledgeItems.updatedAt)).limit(250); const department=String(req.query.department||''); const type=String(req.query.type||''); if(department)rows=rows.filter(item=>item.scope==='organization'||item.departmentId===department); if(type)rows=rows.filter(item=>item.type===type); res.json(rows)
 })
+app.post('/api/brain', async (req,res)=>{ const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'}); const title=String(req.body?.title||'').trim().slice(0,180); const content=String(req.body?.content||'').trim().slice(0,20000); if(!title||!content)return res.status(400).json({error:'title_and_content_required'}); const item={type:String(req.body?.type||'knowledge').slice(0,60),title,content,scope:String(req.body?.scope||'organization').slice(0,60),departmentId:req.body?.departmentId?String(req.body.departmentId).slice(0,80):null,source:String(req.body?.source||'manual').slice(0,120)}; const [created]=await db.insert(knowledgeItems).values(item).returning(); await db.insert(activityLogs).values({actor:'You',action:'brain.created',targetType:'knowledge',targetId:created.id,detail:created.title}); res.status(201).json(created) })
+app.patch('/api/brain/:id', async (req,res)=>{ const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'}); const patch:any={updatedAt:new Date()}; for(const key of ['type','title','content','scope','source'])if(req.body?.[key]!==undefined)patch[key]=String(req.body[key]); if(req.body?.departmentId!==undefined)patch.departmentId=req.body.departmentId?String(req.body.departmentId):null; const [updated]=await db.update(knowledgeItems).set(patch).where(eq(knowledgeItems.id,req.params.id)).returning(); if(!updated)return res.status(404).json({error:'knowledge_not_found'}); await db.insert(activityLogs).values({actor:'You',action:'brain.updated',targetType:'knowledge',targetId:updated.id,detail:updated.title}); res.json(updated) })
+app.delete('/api/brain/:id', async (req,res)=>{ const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'}); const [deleted]=await db.delete(knowledgeItems).where(eq(knowledgeItems.id,req.params.id)).returning(); if(!deleted)return res.status(404).json({error:'knowledge_not_found'}); await db.insert(activityLogs).values({actor:'You',action:'brain.deleted',targetType:'knowledge',targetId:deleted.id,detail:deleted.title}); res.json({ok:true,id:deleted.id}) })
 
-app.post('/api/brain', async (req,res)=>{
-  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
-  const title=String(req.body?.title || '').trim().slice(0,180)
-  const content=String(req.body?.content || '').trim().slice(0,20000)
-  if(!title || !content) return res.status(400).json({error:'title_and_content_required'})
-  const item={
-    type:String(req.body?.type || 'knowledge').slice(0,60),
-    title,
-    content,
-    scope:String(req.body?.scope || 'organization').slice(0,60),
-    departmentId:req.body?.departmentId ? String(req.body.departmentId).slice(0,80) : null,
-    source:String(req.body?.source || 'manual').slice(0,120)
-  }
-  const [created]=await db.insert(knowledgeItems).values(item).returning()
-  await db.insert(activityLogs).values({actor:'You',action:'brain.created',targetType:'knowledge',targetId:created.id,detail:created.title})
-  res.status(201).json(created)
-})
-
-app.patch('/api/brain/:id', async (req,res)=>{
-  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
-  const patch:any={updatedAt:new Date()}
-  for(const key of ['type','title','content','scope','source']) if(req.body?.[key]!==undefined) patch[key]=String(req.body[key])
-  if(req.body?.departmentId!==undefined) patch.departmentId=req.body.departmentId ? String(req.body.departmentId) : null
-  const [updated]=await db.update(knowledgeItems).set(patch).where(eq(knowledgeItems.id,req.params.id)).returning()
-  if(!updated) return res.status(404).json({error:'knowledge_not_found'})
-  await db.insert(activityLogs).values({actor:'You',action:'brain.updated',targetType:'knowledge',targetId:updated.id,detail:updated.title})
-  res.json(updated)
-})
-
-app.delete('/api/brain/:id', async (req,res)=>{
-  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
-  const [deleted]=await db.delete(knowledgeItems).where(eq(knowledgeItems.id,req.params.id)).returning()
-  if(!deleted) return res.status(404).json({error:'knowledge_not_found'})
-  await db.insert(activityLogs).values({actor:'You',action:'brain.deleted',targetType:'knowledge',targetId:deleted.id,detail:deleted.title})
-  res.json({ok:true,id:deleted.id})
-})
-
-app.get('/api/chat/history/:department', async (req,res)=>{
-  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
-  const rows=await db.select().from(conversations).where(eq(conversations.departmentId,req.params.department)).orderBy(desc(conversations.updatedAt)).limit(1)
-  if(!rows[0]) return res.json([])
-  res.json(await db.select().from(messages).where(eq(messages.conversationId,rows[0].id)).orderBy(messages.createdAt).limit(200))
-})
+app.get('/api/chat/history/:department', async (req,res)=>{ const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'}); const rows=await db.select().from(conversations).where(eq(conversations.departmentId,req.params.department)).orderBy(desc(conversations.updatedAt)).limit(1); if(!rows[0])return res.json([]); res.json(await db.select().from(messages).where(eq(messages.conversationId,rows[0].id)).orderBy(messages.createdAt).limit(200)) })
 
 app.post('/api/chat', async (req,res)=>{
-  const state=await readState()
-  const dept=state.departments.find(d=>d.id===req.body?.department)
-  const departmentId=dept?.id ?? String(req.body?.department || 'organization')
-  const departmentName=dept?.name ?? 'Organization'
-  const lead=dept?.lead ?? 'Command Lead'
-  const message=String(req.body?.message || '').trim()
-  if(!message) return res.status(400).json({error:'message_required'})
-  const lower=message.toLowerCase()
-  const persistence = state.persistence === 'postgres' ? 'Persistence is live.' : 'Database is temporarily degraded, so I am operating in memory mode.'
-
+  const state=await readState(); const dept=state.departments.find(d=>d.id===req.body?.department); const departmentId=dept?.id??String(req.body?.department||'organization'); const departmentName=dept?.name??'Organization'; const lead=dept?.lead??'Command Lead'; const message=String(req.body?.message||'').trim(); if(!message)return res.status(400).json({error:'message_required'}); const lower=message.toLowerCase(); const persistence=state.persistence==='postgres'?'Persistence is live.':'Database is temporarily degraded, so I am operating in memory mode.'
   await writeMessage(departmentId,lead,'user',message)
-
-  if (req.body?.delegate === true) {
-    const db=readyDb()
-    if (!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
-    const task={id:`t-delegated-${Date.now()}`,title:message.slice(0,180),department:departmentName,status:'Inbox',owner:lead,priority:'Medium'}
-    await db.insert(tasksTable).values(task)
-    await db.insert(activityLogs).values({actor:lead,action:'lead.delegated',targetType:'task',targetId:task.id,detail:task.title})
-    const reply=`${lead}: Delegated. I created a durable Inbox task and assigned ownership to myself for triage.`
-    await writeMessage(departmentId,lead,'assistant',reply,'orchestrator','durable-delegation')
-    return res.status(201).json({reply,task,provider:'orchestrator'})
-  }
-
-  const deptTasks=state.tasks.filter(t=>t.department===departmentName)
-  const taskContext=deptTasks.map(t=>`${t.status} | ${t.priority} | ${t.owner} | ${t.title}`).join('\n')
-  const brainContext=await getBrainContext(departmentId)
-
-  try {
-    const routed=await routeModel({lead,department:departmentName,message,context:taskContext,knowledge:brainContext})
-    if(routed) {
-      await writeMessage(departmentId,lead,'assistant',routed.text,routed.provider,routed.model)
-      return res.json({reply:routed.text,provider:routed.provider,model:routed.model})
-    }
-  } catch(error) {
-    const db=readyDb()
-    const detail=error instanceof Error ? error.message : 'model_router_error'
-    if(db) await db.insert(activityLogs).values({actor:'Model Router',action:'model.failed',targetType:'department',targetId:departmentId,detail:detail.slice(0,500)})
-    console.error('Model router failed, using deterministic fallback:', detail)
-  }
-
-  let reply=`${lead}: Command received. ${persistence} The model adapter is not configured yet, so I am using deterministic orchestration.`
-  if(lower.includes('block')) {
-    const blocked=state.tasks.filter(t=>t.status==='Waiting' || t.status==='Approval')
-    reply=`${lead}: ${blocked.length} task${blocked.length===1?' is':'s are'} currently blocked by Waiting or Approval. Persistence mode is ${state.persistence}.`
-  }
-  if(lower.includes('summar')) {
-    reply=`${lead}: ${deptTasks.length} durable task${deptTasks.length===1?'':'s'} in ${departmentName}, with ${deptTasks.filter(t=>t.status==='Running').length} running and ${deptTasks.filter(t=>t.status==='Approval').length} awaiting approval. Persistence mode is ${state.persistence}.`
-  }
-  await writeMessage(departmentId,lead,'assistant',reply,'local','deterministic-orchestrator')
-  res.json({reply,provider:'local',model:'deterministic-orchestrator'})
+  if(req.body?.delegate===true){ const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'}); const task={id:`t-delegated-${Date.now()}`,title:message.slice(0,180),department:departmentName,status:'Inbox',owner:lead,priority:'Medium'}; await db.insert(tasksTable).values(task); await db.insert(activityLogs).values({actor:lead,action:'lead.delegated',targetType:'task',targetId:task.id,detail:task.title}); const reply=`${lead}: Delegated. I created a durable Inbox task and assigned ownership to myself for triage.`; await writeMessage(departmentId,lead,'assistant',reply,'orchestrator','durable-delegation'); return res.status(201).json({reply,task,provider:'orchestrator'}) }
+  const deptTasks=state.tasks.filter(t=>t.department===departmentName); const taskContext=deptTasks.map(t=>`${t.status} | ${t.priority} | ${t.owner} | ${t.title}`).join('\n'); const brainContext=await getBrainContext(departmentId)
+  try { const routed=await routeModel({lead,department:departmentName,message,context:taskContext,knowledge:brainContext}); if(routed){ await writeMessage(departmentId,lead,'assistant',routed.text,routed.provider,routed.model); return res.json({reply:routed.text,provider:routed.provider,model:routed.model}) } } catch(error) { const db=readyDb(); const detail=error instanceof Error?error.message:'model_router_error'; if(db)await db.insert(activityLogs).values({actor:'Model Router',action:'model.failed',targetType:'department',targetId:departmentId,detail:detail.slice(0,500)}); console.error('Model router failed, using deterministic fallback:',detail) }
+  let reply=`${lead}: Command received. ${persistence} The model adapter is not configured yet, so I am using deterministic orchestration.`; if(lower.includes('block')){const blocked=state.tasks.filter(t=>t.status==='Waiting'||t.status==='Approval');reply=`${lead}: ${blocked.length} task${blocked.length===1?' is':'s are'} currently blocked by Waiting or Approval. Persistence mode is ${state.persistence}.`} if(lower.includes('summar'))reply=`${lead}: ${deptTasks.length} durable task${deptTasks.length===1?'':'s'} in ${departmentName}, with ${deptTasks.filter(t=>t.status==='Running').length} running and ${deptTasks.filter(t=>t.status==='Approval').length} awaiting approval. Persistence mode is ${state.persistence}.`
+  await writeMessage(departmentId,lead,'assistant',reply,'local','deterministic-orchestrator'); res.json({reply,provider:'local',model:'deterministic-orchestrator'})
 })
 
 async function boot() {
-  try {
-    databaseReady = await ensureSchema()
-    if (databaseReady) {
-      await seedIfNeeded()
-      databaseError = null
-    }
-  } catch (error) {
-    databaseReady = false
-    databaseError = error instanceof Error ? error.message : 'database_boot_error'
-    console.error('Database boot failed, continuing in memory mode:', databaseError)
-  }
-
-  const __dirname=path.dirname(fileURLToPath(import.meta.url))
-  const dist=path.resolve(__dirname,'../dist')
-  app.use(express.static(dist))
-  app.get('/*splat',(_req,res)=>res.sendFile(path.join(dist,'index.html')))
-  app.listen(port,'0.0.0.0',()=>console.log(`Agents Command Center listening on :${port} | persistence=${databaseReady?'postgres':'memory'} | model=${getModelStatus().configured?'configured':'fallback'}`))
+  try { databaseReady=await ensureSchema(); if(databaseReady){await seedIfNeeded();databaseError=null} } catch(error) { databaseReady=false; databaseError=error instanceof Error?error.message:'database_boot_error'; console.error('Database boot failed, continuing in memory mode:',databaseError) }
+  const __dirname=path.dirname(fileURLToPath(import.meta.url)); const dist=path.resolve(__dirname,'../dist'); app.use(express.static(dist)); app.get('/*splat',(_req,res)=>res.sendFile(path.join(dist,'index.html'))); app.listen(port,'0.0.0.0',()=>console.log(`Agents Command Center listening on :${port} | persistence=${databaseReady?'postgres':'memory'} | model=${getModelStatus().configured?'configured':'fallback'}`))
 }
 
 boot().catch(error=>{ console.error('Fatal boot failure',error); process.exit(1) })
