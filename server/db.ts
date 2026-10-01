@@ -18,6 +18,16 @@ export const agents = pgTable('agents', {
   task: text('task'),
 })
 
+export const missions = pgTable('missions', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  title: text('title').notNull(),
+  objective: text('objective').notNull(),
+  status: text('status').notNull().default('active'),
+  departmentIds: text('department_ids').notNull().default('[]'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+})
+
 export const tasks = pgTable('tasks', {
   id: text('id').primaryKey(),
   title: text('title').notNull(),
@@ -25,6 +35,7 @@ export const tasks = pgTable('tasks', {
   status: text('status').notNull(),
   owner: text('owner').notNull(),
   priority: text('priority').notNull(),
+  missionId: uuid('mission_id'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 })
@@ -115,6 +126,15 @@ export async function ensureSchema() {
       status text not null,
       task text
     );
+    create table if not exists missions (
+      id uuid primary key default gen_random_uuid(),
+      title text not null,
+      objective text not null,
+      status text not null default 'active',
+      department_ids text not null default '[]',
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
     create table if not exists tasks (
       id text primary key,
       title text not null,
@@ -125,6 +145,8 @@ export async function ensureSchema() {
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now()
     );
+    alter table tasks add column if not exists mission_id uuid;
+    create index if not exists tasks_mission_idx on tasks(mission_id);
     create table if not exists approvals (
       id uuid primary key default gen_random_uuid(),
       title text not null,
