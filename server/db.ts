@@ -18,6 +18,20 @@ export const agents = pgTable('agents', {
   task: text('task'),
 })
 
+export const agentRuns = pgTable('agent_runs', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  agentId: text('agent_id').notNull(),
+  departmentId: text('department_id').notNull(),
+  skill: text('skill').notNull(),
+  status: text('status').notNull().default('queued'),
+  input: text('input'),
+  output: text('output'),
+  taskId: text('task_id'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  startedAt: timestamp('started_at', { withTimezone: true }),
+  completedAt: timestamp('completed_at', { withTimezone: true }),
+})
+
 export const missions = pgTable('missions', {
   id: uuid('id').defaultRandom().primaryKey(),
   title: text('title').notNull(),
@@ -126,6 +140,21 @@ export async function ensureSchema() {
       status text not null,
       task text
     );
+    create table if not exists agent_runs (
+      id uuid primary key default gen_random_uuid(),
+      agent_id text not null,
+      department_id text not null,
+      skill text not null,
+      status text not null default 'queued',
+      input text,
+      output text,
+      task_id text,
+      created_at timestamptz not null default now(),
+      started_at timestamptz,
+      completed_at timestamptz
+    );
+    create index if not exists agent_runs_department_idx on agent_runs(department_id, created_at desc);
+    create index if not exists agent_runs_agent_idx on agent_runs(agent_id, created_at desc);
     create table if not exists missions (
       id uuid primary key default gen_random_uuid(),
       title text not null,
