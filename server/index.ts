@@ -1,7 +1,7 @@
 import express from 'express'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { eq } from 'drizzle-orm'
+import { desc, eq } from 'drizzle-orm'
 import { activityLogs, agents as agentsTable, approvals as approvalsTable, departments as departmentsTable, ensureSchema, getDb, tasks as tasksTable } from './db.js'
 
 const app = express()
@@ -50,6 +50,7 @@ async function seedIfNeeded() {
     {title:'Vendor payment',requestedBy:'Audit'},
     {title:'Campaign publish',requestedBy:'Maya'}
   ])
+  await db.insert(activityLogs).values({actor:'System',action:'seeded',targetType:'workspace',targetId:'default',detail:'Initial P0 seed loaded'})
 }
 
 async function readState() {
@@ -74,7 +75,7 @@ async function readState() {
 
 app.get('/api/health', async (_req,res)=>{
   const database = databaseReady ? 'connected' : (process.env.DATABASE_URL ? 'degraded' : 'not-configured')
-  res.json({ok:true,service:'agents-command-center',version:'0.2.1',database,databaseError,persistence:databaseReady?'postgres':'memory'})
+  res.json({ok:true,service:'agents-command-center',version:'0.3.0',database,databaseError,persistence:databaseReady?'postgres':'memory'})
 })
 
 app.get('/api/state', async (_req,res)=>{
@@ -84,7 +85,7 @@ app.get('/api/state', async (_req,res)=>{
 app.post('/api/tasks', async (req,res)=>{
   const task={
     id:String(req.body?.id || `t-${Date.now()}`),
-    title:String(req.body?.title || 'Untitled task'),
+    title:String(req.body?.title || 'Untitled task').trim().slice(0,180),
     department:String(req.body?.department || 'Marketing'),
     status:String(req.body?.status || 'Inbox'),
     owner:String(req.body?.owner || 'Unassigned'),
@@ -108,9 +109,18 @@ app.patch('/api/tasks/:id', async (req,res)=>{
   res.json(updated)
 })
 
+app.delete('/api/tasks/:id', async (req,res)=>{
+  const db=readyDb()
+  if (!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  const [deleted]=await db.delete(tasksTable).where(eq(tasksTable.id,req.params.id)).returning()
+  if (!deleted) return res.status(404).json({error:'task_not_found'})
+  await db.insert(activityLogs).values({actor:'You',action:'task.deleted',targetType:'task',targetId:req.params.id,detail:deleted.title})
+  res.json({ok:true,id:req.params.id})
+})
+
 app.get('/api/approvals', async (_req,res)=>{
   const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
-  res.json(await db.select().from(approvalsTable))
+  res.json(await db.select().from(approvalsTable).orderBy(desc(approvalsTable.createdAt)))
 })
 
 app.patch('/api/approvals/:id', async (req,res)=>{
@@ -125,19 +135,42 @@ app.patch('/api/approvals/:id', async (req,res)=>{
 
 app.get('/api/activity', async (_req,res)=>{
   const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
-  res.json(await db.select().from(activityLogs))
+  res.json(await db.select().from(activityLogs).orderBy(desc(activityLogs.createdAt)).limit(100))
 })
 
 app.post('/api/chat', async (req,res)=>{
   const state=await readState()
   const dept=state.departments.find(d=>d.id===req.body?.department)
   const lead=dept?.lead ?? 'Command Lead'
-  const message=String(req.body?.message || '')
+  const message=String(req.body?.message || '').trim()
   const lower=message.toLowerCase()
   const persistence = state.persistence === 'postgres' ? 'Persistence is live.' : 'Database is temporarily degraded, so I am operating in memory mode.'
-  let reply=`${lead}: Command received. ${persistence} The next step is connecting the model router so I can decompose this into delegated tasks.`
-  if(lower.includes('block')) reply=`${lead}: Current blockers are visible from the active task and agent state. Persistence mode is ${state.persistence}.`
-  if(lower.includes('summar')) reply=`${lead}: I can summarize the current department state. Persistence mode is ${state.persistence}.`
+
+  if (req.body?.delegate === true && message) {
+    const db=readyDb()
+    if (!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
+    const task={
+      id:`t-delegated-${Date.now()}`,
+      title:message.slice(0,180),
+      department:dept?.name ?? 'Marketing',
+      status:'Inbox',
+      owner:lead,
+      priority:'Medium'
+    }
+    await db.insert(tasksTable).values(task)
+    await db.insert(activityLogs).values({actor:lead,action:'lead.delegated',targetType:'task',targetId:task.id,detail:task.title})
+    return res.status(201).json({reply:`${lead}: Delegated. I created a durable Inbox task and assigned ownership to myself for triage.`,task})
+  }
+
+  let reply=`${lead}: Command received. ${persistence} Model routing is the next intelligence layer; durable work operations are already online.`
+  if(lower.includes('block')) {
+    const blocked=state.tasks.filter(t=>t.status==='Waiting' || t.status==='Approval')
+    reply=`${lead}: ${blocked.length} task${blocked.length===1?' is':'s are'} currently blocked by Waiting or Approval. Persistence mode is ${state.persistence}.`
+  }
+  if(lower.includes('summar')) {
+    const deptTasks=state.tasks.filter(t=>t.department===dept?.name)
+    reply=`${lead}: ${deptTasks.length} durable task${deptTasks.length===1?'':'s'} in ${dept?.name ?? 'this department'}, with ${deptTasks.filter(t=>t.status==='Running').length} running and ${deptTasks.filter(t=>t.status==='Approval').length} awaiting approval. Persistence mode is ${state.persistence}.`
+  }
   res.json({reply})
 })
 
