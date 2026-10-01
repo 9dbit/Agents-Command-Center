@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { desc, eq } from 'drizzle-orm'
 import {
   activityLogs, agents as agentsTable, approvals as approvalsTable, conversations,
-  departments as departmentsTable, ensureSchema, getDb, knowledgeItems, messages,
+  departments as departmentsTable, ensureSchema, getDb, knowledgeItems, messages, missions as missionsTable,
   tasks as tasksTable
 } from './db.js'
 import { getModelStatus, routeModel } from './modelRouter.js'
@@ -110,7 +110,7 @@ async function getBrainContext(departmentId:string) {
 
 app.get('/api/health', async (_req,res)=>{
   const database = databaseReady ? 'connected' : (process.env.DATABASE_URL ? 'degraded' : 'not-configured')
-  res.json({ok:true,service:'agents-command-center',version:'0.5.0',database,databaseError,persistence:databaseReady?'postgres':'memory',model:getModelStatus()})
+  res.json({ok:true,service:'agents-command-center',version:'0.6.0',database,databaseError,persistence:databaseReady?'postgres':'memory',model:getModelStatus()})
 })
 
 app.get('/api/model/status',(_req,res)=>res.json(getModelStatus()))
@@ -146,6 +146,39 @@ app.post('/api/tools/github/sync', async (_req,res)=>{
     await db.insert(activityLogs).values({actor:'GitHub Connector',action:'tool.synced',targetType:'knowledge',targetId:item.id,detail:snapshot.repository})
     res.json({ok:true,item,snapshot})
   } catch(error) { res.status(502).json({error:error instanceof Error?error.message:'github_sync_error'}) }
+})
+
+app.get('/api/missions', async (_req,res)=>{
+  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  const [missionRows,taskRows]=await Promise.all([db.select().from(missionsTable).orderBy(desc(missionsTable.createdAt)),db.select().from(tasksTable)])
+  res.json(missionRows.map(m=>({...m,departmentIds:JSON.parse(m.departmentIds||'[]'),tasks:taskRows.filter(t=>t.missionId===m.id).map(({createdAt,updatedAt,missionId,...t})=>t)})))
+})
+
+app.post('/api/missions', async (req,res)=>{
+  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  const title=String(req.body?.title||'').trim().slice(0,180)
+  const objective=String(req.body?.objective||'').trim().slice(0,4000)
+  const requested=Array.isArray(req.body?.departmentIds)?req.body.departmentIds.map(String):[]
+  const state=await readState()
+  const departmentIds=[...new Set(requested)].filter(id=>state.departments.some(d=>d.id===id))
+  if(!title||!objective||!departmentIds.length)return res.status(400).json({error:'title_objective_departments_required'})
+  const [mission]=await db.insert(missionsTable).values({title,objective,departmentIds:JSON.stringify(departmentIds)}).returning()
+  const workstreams=departmentIds.map(id=>state.departments.find(d=>d.id===id)!).filter(Boolean).map(d=>({id:`t-mission-${mission.id.slice(0,8)}-${d.id}`,title:`${title}: ${d.name} workstream`,department:d.name,status:'Planned',owner:d.lead,priority:'High',missionId:mission.id}))
+  if(workstreams.length)await db.insert(tasksTable).values(workstreams)
+  await db.insert(activityLogs).values({actor:'Mission Control',action:'mission.created',targetType:'mission',targetId:mission.id,detail:title})
+  res.status(201).json({...mission,departmentIds,tasks:workstreams})
+})
+
+app.patch('/api/missions/:id', async (req,res)=>{
+  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  const patch:any={updatedAt:new Date()}
+  if(req.body?.status!==undefined){const status=String(req.body.status);if(!['active','paused','completed'].includes(status))return res.status(400).json({error:'invalid_status'});patch.status=status}
+  if(req.body?.title!==undefined)patch.title=String(req.body.title).trim().slice(0,180)
+  if(req.body?.objective!==undefined)patch.objective=String(req.body.objective).trim().slice(0,4000)
+  const [updated]=await db.update(missionsTable).set(patch).where(eq(missionsTable.id,req.params.id)).returning()
+  if(!updated)return res.status(404).json({error:'mission_not_found'})
+  await db.insert(activityLogs).values({actor:'Mission Control',action:'mission.updated',targetType:'mission',targetId:updated.id,detail:updated.status})
+  res.json({...updated,departmentIds:JSON.parse(updated.departmentIds||'[]')})
 })
 
 app.get('/api/state', async (_req,res)=>{
