@@ -8,6 +8,10 @@ const app = express()
 const port = Number(process.env.PORT || 3000)
 app.use(express.json())
 
+let databaseReady = false
+let databaseError: string | null = null
+const readyDb = () => databaseReady ? getDb() : null
+
 const seedDepartments = [
   {id:'marketing',name:'Marketing',accent:'#ef5a8c',lead:'Maya',agents:[
     {id:'m1',name:'Maya',role:'Marketing Lead',status:'working',task:'Launch campaign plan'},
@@ -34,7 +38,7 @@ const seedTasks = [
 const tools=[{name:'GitHub',status:'connected'},{name:'Google Drive',status:'connected'},{name:'Gmail',status:'connected'},{name:'Railway',status:'ready'},{name:'Browser',status:'ready'},{name:'Figma',status:'offline'}]
 
 async function seedIfNeeded() {
-  const db = getDb()
+  const db = readyDb()
   if (!db) return
   const existing = await db.select().from(departmentsTable)
   if (existing.length) return
@@ -49,26 +53,28 @@ async function seedIfNeeded() {
 }
 
 async function readState() {
-  const db = getDb()
-  if (!db) return { departments: seedDepartments, tasks: seedTasks, approvals: 3, tools, persistence:'memory' }
-  const [departmentRows, agentRows, taskRows, approvalRows] = await Promise.all([
-    db.select().from(departmentsTable),
-    db.select().from(agentsTable),
-    db.select().from(tasksTable),
-    db.select().from(approvalsTable)
-  ])
-  const departments = departmentRows.map(d => ({...d, agents:agentRows.filter(a => a.departmentId===d.id).map(({departmentId, ...a})=>a)}))
-  return {departments,tasks:taskRows.map(({createdAt,updatedAt,...t})=>t),approvals:approvalRows.filter(a=>a.status==='pending').length,tools,persistence:'postgres'}
+  const db = readyDb()
+  if (!db) return { departments: seedDepartments, tasks: seedTasks, approvals: 3, tools, persistence:'memory', databaseError }
+  try {
+    const [departmentRows, agentRows, taskRows, approvalRows] = await Promise.all([
+      db.select().from(departmentsTable),
+      db.select().from(agentsTable),
+      db.select().from(tasksTable),
+      db.select().from(approvalsTable)
+    ])
+    const departments = departmentRows.map(d => ({...d, agents:agentRows.filter(a => a.departmentId===d.id).map(({departmentId, ...a})=>a)}))
+    return {departments,tasks:taskRows.map(({createdAt,updatedAt,...t})=>t),approvals:approvalRows.filter(a=>a.status==='pending').length,tools,persistence:'postgres'}
+  } catch (error) {
+    databaseReady = false
+    databaseError = error instanceof Error ? error.message : 'database_error'
+    console.error('Database read failed, switching to memory mode:', databaseError)
+    return { departments: seedDepartments, tasks: seedTasks, approvals: 3, tools, persistence:'memory', databaseError }
+  }
 }
 
 app.get('/api/health', async (_req,res)=>{
-  try {
-    const db = getDb()
-    if (db) await db.select().from(departmentsTable).limit(1)
-    res.json({ok:true,service:'agents-command-center',version:'0.2.0',database:db?'connected':'not-configured'})
-  } catch (error) {
-    res.status(503).json({ok:false,service:'agents-command-center',version:'0.2.0',database:'error',error:error instanceof Error?error.message:'unknown'})
-  }
+  const database = databaseReady ? 'connected' : (process.env.DATABASE_URL ? 'degraded' : 'not-configured')
+  res.json({ok:true,service:'agents-command-center',version:'0.2.1',database,databaseError,persistence:databaseReady?'postgres':'memory'})
 })
 
 app.get('/api/state', async (_req,res)=>{
@@ -84,16 +90,16 @@ app.post('/api/tasks', async (req,res)=>{
     owner:String(req.body?.owner || 'Unassigned'),
     priority:String(req.body?.priority || 'Medium')
   }
-  const db=getDb()
-  if (!db) return res.status(503).json({error:'database_not_configured'})
+  const db=readyDb()
+  if (!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
   await db.insert(tasksTable).values(task)
   await db.insert(activityLogs).values({actor:'You',action:'task.created',targetType:'task',targetId:task.id,detail:task.title})
   res.status(201).json(task)
 })
 
 app.patch('/api/tasks/:id', async (req,res)=>{
-  const db=getDb()
-  if (!db) return res.status(503).json({error:'database_not_configured'})
+  const db=readyDb()
+  if (!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
   const patch:any={updatedAt:new Date()}
   for (const key of ['title','department','status','owner','priority']) if (req.body?.[key]!==undefined) patch[key]=String(req.body[key])
   const [updated]=await db.update(tasksTable).set(patch).where(eq(tasksTable.id,req.params.id)).returning()
@@ -103,12 +109,12 @@ app.patch('/api/tasks/:id', async (req,res)=>{
 })
 
 app.get('/api/approvals', async (_req,res)=>{
-  const db=getDb(); if(!db) return res.status(503).json({error:'database_not_configured'})
+  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
   res.json(await db.select().from(approvalsTable))
 })
 
 app.patch('/api/approvals/:id', async (req,res)=>{
-  const db=getDb(); if(!db) return res.status(503).json({error:'database_not_configured'})
+  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
   const status=String(req.body?.status || '')
   if(!['approved','rejected','pending'].includes(status)) return res.status(400).json({error:'invalid_status'})
   const [updated]=await db.update(approvalsTable).set({status,decidedBy:status==='pending'?null:'You',decidedAt:status==='pending'?null:new Date()}).where(eq(approvalsTable.id,req.params.id)).returning()
@@ -118,7 +124,7 @@ app.patch('/api/approvals/:id', async (req,res)=>{
 })
 
 app.get('/api/activity', async (_req,res)=>{
-  const db=getDb(); if(!db) return res.status(503).json({error:'database_not_configured'})
+  const db=readyDb(); if(!db) return res.status(503).json({error:'database_unavailable',mode:'memory'})
   res.json(await db.select().from(activityLogs))
 })
 
@@ -128,20 +134,31 @@ app.post('/api/chat', async (req,res)=>{
   const lead=dept?.lead ?? 'Command Lead'
   const message=String(req.body?.message || '')
   const lower=message.toLowerCase()
-  let reply=`${lead}: Command received. Persistence is live. The next step is connecting the model router so I can decompose this into durable delegated tasks.`
-  if(lower.includes('block')) reply=`${lead}: Current blockers are visible from persisted task and agent state. I can now keep them durable across deploys.`
-  if(lower.includes('summar')) reply=`${lead}: I am reading the current persisted department state from PostgreSQL and can summarize work consistently across sessions.`
+  const persistence = state.persistence === 'postgres' ? 'Persistence is live.' : 'Database is temporarily degraded, so I am operating in memory mode.'
+  let reply=`${lead}: Command received. ${persistence} The next step is connecting the model router so I can decompose this into delegated tasks.`
+  if(lower.includes('block')) reply=`${lead}: Current blockers are visible from the active task and agent state. Persistence mode is ${state.persistence}.`
+  if(lower.includes('summar')) reply=`${lead}: I can summarize the current department state. Persistence mode is ${state.persistence}.`
   res.json({reply})
 })
 
 async function boot() {
-  const configured = await ensureSchema()
-  if (configured) await seedIfNeeded()
+  try {
+    databaseReady = await ensureSchema()
+    if (databaseReady) {
+      await seedIfNeeded()
+      databaseError = null
+    }
+  } catch (error) {
+    databaseReady = false
+    databaseError = error instanceof Error ? error.message : 'database_boot_error'
+    console.error('Database boot failed, continuing in memory mode:', databaseError)
+  }
+
   const __dirname=path.dirname(fileURLToPath(import.meta.url))
   const dist=path.resolve(__dirname,'../dist')
   app.use(express.static(dist))
   app.get('/*splat',(_req,res)=>res.sendFile(path.join(dist,'index.html')))
-  app.listen(port,'0.0.0.0',()=>console.log(`Agents Command Center listening on :${port} | persistence=${configured?'postgres':'memory'}`))
+  app.listen(port,'0.0.0.0',()=>console.log(`Agents Command Center listening on :${port} | persistence=${databaseReady?'postgres':'memory'}`))
 }
 
-boot().catch(error=>{ console.error('Boot failed',error); process.exit(1) })
+boot().catch(error=>{ console.error('Fatal boot failure',error); process.exit(1) })
