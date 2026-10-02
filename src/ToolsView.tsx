@@ -20,7 +20,7 @@ export default function ToolsWorkspace(){
   const refresh=async()=>{
     setBusy(true); setNote('')
     try{
-      const [statusRes,githubRes,runsRes]=await Promise.all([fetch('/api/tools/status'),fetch('/api/tools/github'),fetch('/api/runs?department=engineering')])
+      const [statusRes,githubRes,runsRes]=await Promise.all([fetch('/api/tools/status'),fetch('/api/tools/github'),fetch('/api/runs')])
       if(statusRes.ok) setConnectors((await statusRes.json()).connectors || [])
       if(githubRes.ok) setSnapshot(await githubRes.json())
       if(runsRes.ok) setRuns(await runsRes.json())
@@ -52,6 +52,18 @@ export default function ToolsWorkspace(){
     finally{setBusy(false)}
   }
 
+  const runOrionGate=async()=>{
+    setBusy(true); setNote('')
+    try{
+      const r=await fetch('/api/runs',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agentId:'o1',departmentId:'operations',skill:'operations.release-gate',input:'Run production readiness gate across persistence, source control, approvals, blockers, and model state.'})})
+      const data=await r.json()
+      if(!r.ok) throw new Error(data.output || data.error || 'agent_run_failed')
+      setNote(`Orion completed operations.release-gate and wrote the result to Organization Brain.`)
+      await refresh()
+    }catch(error){setNote(error instanceof Error?error.message:'Agent run failed')}
+    finally{setBusy(false)}
+  }
+
   const github=connectors.find(c=>c.id==='github')
   return <div className="tools-workspace">
     <section className="tools-hero">
@@ -64,7 +76,7 @@ export default function ToolsWorkspace(){
         <div className="connector-title"><div className="connector-logo"><GitBranch/></div><div><h3>GitHub</h3><span><CheckCircle2 size={12}/> LIVE CONNECTOR</span></div></div>
         <div className="connector-meta"><div><span>Mode</span><b>{github?.mode || 'public-read'}</b></div><div><span>Repository</span><b>{github?.repository || snapshot?.repository || 'Loading…'}</b></div></div>
         <div className="capabilities">{(github?.capabilities || []).map(c=><span key={c}>{c}</span>)}</div>
-        <div className="connector-actions"><button className="sync-brain" onClick={syncBrain} disabled={busy}><Brain size={14}/> Sync repository to Brain</button><button className="agent-run-btn" onClick={runForgeAudit} disabled={busy}><GitBranch size={14}/> Run Forge repo audit</button></div>
+        <div className="connector-actions"><button className="sync-brain" onClick={syncBrain} disabled={busy}><Brain size={14}/> Sync repository to Brain</button><button className="agent-run-btn" onClick={runForgeAudit} disabled={busy}><GitBranch size={14}/> Run Forge repo audit</button><button className="agent-run-btn operations" onClick={runOrionGate} disabled={busy}><CheckCircle2 size={14}/> Run Orion release gate</button></div>
       </article>
 
       <article className="connector-card planned"><div className="connector-title"><div className="connector-logo">GD</div><div><h3>Google Drive</h3><span>PLANNED CONNECTOR</span></div></div><p>Documents, SOPs, briefs, and project files with provenance.</p></article>
@@ -78,8 +90,8 @@ export default function ToolsWorkspace(){
     </section>}
 
     <section className="agent-runs panel">
-      <div className="snapshot-head"><div><span className="eyebrow">REAL AGENT EXECUTION</span><h3>Forge · Engineering</h3><p>Skill runs are durable, auditable, and may write verified results into the Brain.</p></div><span className="run-count">{runs.length} runs</span></div>
-      <div className="run-list">{runs.length===0?<div className="run-empty">No Forge runs yet. Run the repository audit to create the first real tool-backed execution.</div>:runs.slice(0,8).map(run=><div className="run-row" key={run.id}><span className={`run-status ${run.status}`}>{run.status}</span><div><b>{run.skill}</b><p>{run.output || run.input || 'Queued'}</p></div><small>{new Date(run.createdAt).toLocaleString()}</small></div>)}</div>
+      <div className="snapshot-head"><div><span className="eyebrow">REAL AGENT EXECUTION</span><h3>Durable skill runs</h3><p>Forge and Orion execute tool-backed skills, write verified results into the Brain, and leave an audit trail.</p></div><span className="run-count">{runs.length} runs</span></div>
+      <div className="run-list">{runs.length===0?<div className="run-empty">No agent runs yet. Run an available skill to create the first tool-backed execution.</div>:runs.slice(0,8).map(run=><div className="run-row" key={run.id}><span className={`run-status ${run.status}`}>{run.status}</span><div><b>{run.agentId==='e1'?'Forge':run.agentId==='o1'?'Orion':run.agentId} · {run.skill}</b><p>{run.output || run.input || 'Queued'}</p></div><small>{new Date(run.createdAt).toLocaleString()}</small></div>)}</div>
     </section>
 
     {note && <div className="tool-note">{note}</div>}
