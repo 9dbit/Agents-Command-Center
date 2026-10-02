@@ -17,7 +17,7 @@ export default function AgentCapabilityOverlay(){
 
   useEffect(()=>{
     const version=document.querySelector('.system-live span')
-    if(version) version.textContent='v0.8'
+    if(version) version.textContent='v0.9'
     const click=(event:MouseEvent)=>{
       const target=event.target as HTMLElement|null
       const card=target?.closest('.floor .agent') as HTMLElement|null

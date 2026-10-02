@@ -1,10 +1,10 @@
 import express from 'express'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { desc, eq } from 'drizzle-orm'
+import { and, desc, eq, isNull } from 'drizzle-orm'
 import {
-  activityLogs, agentRuns, agents as agentsTable, approvals as approvalsTable, conversations,
-  departments as departmentsTable, ensureSchema, getDb, knowledgeItems, messages, missions as missionsTable,
+  activityLogs, agentRuns, agentSkillAssignments, agents as agentsTable, approvals as approvalsTable, conversations,
+  departments as departmentsTable, ensureSchema, getDb, knowledgeItems, messages, missions as missionsTable, skillDefinitions,
   tasks as tasksTable
 } from './db.js'
 import { getModelStatus, routeModel } from './modelRouter.js'
@@ -42,6 +42,39 @@ const seedTasks = [
 ]
 
 const tools=[{name:'GitHub',status:'connected'},{name:'Google Drive',status:'connected'},{name:'Gmail',status:'connected'},{name:'Railway',status:'ready'},{name:'Browser',status:'ready'},{name:'Figma',status:'offline'}]
+
+const seedSkills = [
+  {agentId:'e1',slot:'primary',skillKey:'github.repo-audit',version:1,label:'Repository Audit',tool:'GitHub',status:'ready',executable:true,approvalRequired:false,permissions:['github.read','brain.write:analysis']},
+  {agentId:'o1',slot:'primary',skillKey:'operations.release-gate',version:1,label:'Production Release Gate',tool:'GitHub + Command Center',status:'ready',executable:true,approvalRequired:false,permissions:['github.read','workspace.read','approvals.read','brain.write:analysis']},
+  {agentId:'m1',slot:'primary',skillKey:'lead.durable-delegation',version:1,label:'Durable Delegation',tool:'Command Center',status:'ready',executable:false,approvalRequired:false,permissions:['task.create','agent.delegate']},
+  {agentId:'m2',slot:'primary',skillKey:'marketing.market-research',version:1,label:'Market Research',tool:'Browser',status:'planned',executable:false,approvalRequired:false,permissions:['browser.read','brain.write:analysis']},
+  {agentId:'m3',slot:'primary',skillKey:'marketing.creative-brief',version:1,label:'Creative Brief',tool:'Brain',status:'planned',executable:false,approvalRequired:true,permissions:['brain.read','brain.write:draft']},
+  {agentId:'m4',slot:'primary',skillKey:'marketing.copy-draft',version:1,label:'Campaign Copy Draft',tool:'Brain',status:'planned',executable:false,approvalRequired:true,permissions:['brain.read','brain.write:draft']},
+  {agentId:'m5',slot:'primary',skillKey:'marketing.social-calendar',version:1,label:'Social Calendar',tool:'Brain',status:'planned',executable:false,approvalRequired:true,permissions:['brain.read','brain.write:draft']},
+  {agentId:'m6',slot:'primary',skillKey:'marketing.seo-map',version:1,label:'SEO Opportunity Map',tool:'Browser',status:'planned',executable:false,approvalRequired:false,permissions:['browser.read','brain.write:analysis']},
+  {agentId:'m7',slot:'primary',skillKey:'marketing.performance-summary',version:1,label:'Performance Summary',tool:'Analytics',status:'planned',executable:false,approvalRequired:false,permissions:['analytics.read','brain.write:analysis']},
+  {agentId:'s1',slot:'primary',skillKey:'sales.pipeline-review',version:1,label:'Pipeline Review',tool:'CRM',status:'planned',executable:false,approvalRequired:false,permissions:['crm.read','brain.write:analysis']},
+  {agentId:'f1',slot:'primary',skillKey:'finance.cashflow-brief',version:1,label:'Cashflow Brief',tool:'Finance Data',status:'planned',executable:false,approvalRequired:true,permissions:['finance.read','brain.write:analysis']},
+  {agentId:'c1',slot:'primary',skillKey:'support.inbox-triage',version:1,label:'Inbox Triage',tool:'Gmail',status:'planned',executable:false,approvalRequired:true,permissions:['gmail.read','task.create']}
+]
+
+const knownSkillExecutors = new Set(['github.repo-audit','operations.release-gate'])
+const parseJsonArray = (value:string|null|undefined) => { try { const v=JSON.parse(value||'[]'); return Array.isArray(v)?v:[] } catch { return [] } }
+const skillDefinitionDto = (row:any) => ({...row,permissions:parseJsonArray(row.permissions),engineAvailable:knownSkillExecutors.has(row.skillKey)})
+
+async function seedSkillsIfNeeded() {
+  const db=readyDb(); if(!db) return
+  const definitions=await db.select().from(skillDefinitions)
+  for(const seed of seedSkills){
+    let definition=definitions.find(d=>d.skillKey===seed.skillKey&&d.version===seed.version)
+    if(!definition){
+      ;[definition]=await db.insert(skillDefinitions).values({skillKey:seed.skillKey,version:seed.version,label:seed.label,tool:seed.tool,status:seed.status,executable:seed.executable,approvalRequired:seed.approvalRequired,permissions:JSON.stringify(seed.permissions)}).returning()
+      definitions.push(definition)
+    }
+    const active=await db.select().from(agentSkillAssignments).where(and(eq(agentSkillAssignments.agentId,seed.agentId),eq(agentSkillAssignments.slot,seed.slot),isNull(agentSkillAssignments.replacedAt))).limit(1)
+    if(!active[0]) await db.insert(agentSkillAssignments).values({agentId:seed.agentId,slot:seed.slot,skillDefinitionId:definition.id,enabled:true})
+  }
+}
 
 async function seedIfNeeded() {
   const db = readyDb()
@@ -124,16 +157,103 @@ async function completeLinkedTask(taskId:string|null) {
   if(task?.missionId) await reconcileMission(task.missionId)
 }
 
+async function getAgentProfile(agentId:string) {
+  const db=readyDb(); if(!db) return null
+  const [agent]=await db.select().from(agentsTable).where(eq(agentsTable.id,agentId)).limit(1)
+  if(!agent) return null
+  const [department]=await db.select().from(departmentsTable).where(eq(departmentsTable.id,agent.departmentId)).limit(1)
+  const [assignments,definitions,runs,taskRows,brainRows]=await Promise.all([
+    db.select().from(agentSkillAssignments).where(and(eq(agentSkillAssignments.agentId,agent.id),isNull(agentSkillAssignments.replacedAt))).orderBy(agentSkillAssignments.assignedAt),
+    db.select().from(skillDefinitions),
+    db.select().from(agentRuns).where(eq(agentRuns.agentId,agent.id)).orderBy(desc(agentRuns.createdAt)).limit(20),
+    db.select().from(tasksTable),
+    db.select().from(knowledgeItems).orderBy(desc(knowledgeItems.updatedAt)).limit(250)
+  ])
+  const skills=assignments.map(a=>{
+    const d=definitions.find(x=>x.id===a.skillDefinitionId)
+    return d?{assignmentId:a.id,slot:a.slot,enabled:a.enabled,assignedAt:a.assignedAt,...skillDefinitionDto(d)}:null
+  }).filter(Boolean)
+  const lead=department?.lead===agent.name
+  const permissions=lead?['brain.read','task.create','task.update','approval.request','agent.delegate']:['brain.read:scope','task.update:own','tool.execute:assigned']
+  const skillPermissions=[...new Set(skills.flatMap((skill:any)=>skill.permissions||[]))]
+  const currentTasks=taskRows.filter(task=>task.owner===agent.name&&task.status!=='Done').slice(0,12)
+  const accessibleBrain=brainRows.filter(item=>item.scope==='organization'||item.departmentId===agent.departmentId)
+  return {agent,department,capabilities:{lead,skills,tools:[...new Set(skills.map((skill:any)=>skill.tool))],permissions:[...new Set([...permissions,...skillPermissions])],memoryScope:lead?'organization + department':'department scoped'},currentTasks,recentRuns:runs,brain:{accessibleItems:accessibleBrain.length,scope:lead?'organization + department':'department scoped'}}
+}
+
+async function resolveSkillDefinition(input:any) {
+  const db=readyDb(); if(!db) return null
+  if(input?.skillDefinitionId){
+    const [existing]=await db.select().from(skillDefinitions).where(eq(skillDefinitions.id,String(input.skillDefinitionId))).limit(1)
+    return existing||null
+  }
+  const skillKey=String(input?.skillKey||'').trim().slice(0,120)
+  const label=String(input?.label||'').trim().slice(0,180)
+  if(!skillKey||!label) return null
+  const existing=await db.select().from(skillDefinitions).where(eq(skillDefinitions.skillKey,skillKey)).orderBy(desc(skillDefinitions.version))
+  const requested=Number(input?.version)
+  const version=Number.isInteger(requested)&&requested>0?requested:(existing[0]?.version||0)+1
+  const same=existing.find(row=>row.version===version)
+  if(same) return same
+  const status=['draft','planned','ready','deprecated'].includes(String(input?.status))?String(input.status):'draft'
+  const permissions=Array.isArray(input?.permissions)?input.permissions.map(String).slice(0,50):[]
+  const [created]=await db.insert(skillDefinitions).values({
+    skillKey,version,label,description:input?.description?String(input.description).slice(0,2000):null,
+    tool:String(input?.tool||'Brain').slice(0,180),status,executable:Boolean(input?.executable),approvalRequired:Boolean(input?.approvalRequired),
+    permissions:JSON.stringify(permissions),inputSchema:JSON.stringify(input?.inputSchema&&typeof input.inputSchema==='object'?input.inputSchema:{}),outputSchema:JSON.stringify(input?.outputSchema&&typeof input.outputSchema==='object'?input.outputSchema:{})
+  }).returning()
+  return created
+}
+
 app.get('/api/health', async (_req,res)=>{
   const database = databaseReady ? 'connected' : (process.env.DATABASE_URL ? 'degraded' : 'not-configured')
-  res.json({ok:true,service:'agents-command-center',version:'0.7.0',database,databaseError,persistence:databaseReady?'postgres':'memory',model:getModelStatus()})
+  res.json({ok:true,service:'agents-command-center',version:'0.9.0',database,databaseError,persistence:databaseReady?'postgres':'memory',model:getModelStatus()})
 })
 app.get('/api/model/status',(_req,res)=>res.json(getModelStatus()))
 app.get('/api/tools/status',(_req,res)=>res.json(getToolStatus()))
-app.get('/api/skills',(_req,res)=>res.json([
-  {id:'github.repo-audit',agentId:'e1',departmentId:'engineering',agent:'Forge',label:'Repository Audit',tool:'GitHub'},
-  {id:'operations.release-gate',agentId:'o1',departmentId:'operations',agent:'Orion',label:'Production Release Gate',tool:'GitHub + Command Center'}
-]))
+
+app.get('/api/skills',async (_req,res)=>{
+  const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  const [assignments,definitions,agentRows,departmentRows]=await Promise.all([db.select().from(agentSkillAssignments).where(isNull(agentSkillAssignments.replacedAt)),db.select().from(skillDefinitions),db.select().from(agentsTable),db.select().from(departmentsTable)])
+  res.json(assignments.map(a=>{const d=definitions.find(x=>x.id===a.skillDefinitionId),agent=agentRows.find(x=>x.id===a.agentId),department=departmentRows.find(x=>x.id===agent?.departmentId);return d?{assignmentId:a.id,slot:a.slot,enabled:a.enabled,agentId:a.agentId,agent:agent?.name||a.agentId,departmentId:department?.id||agent?.departmentId,...skillDefinitionDto(d)}:null}).filter(Boolean))
+})
+app.get('/api/skills/library',async (_req,res)=>{
+  const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  res.json((await db.select().from(skillDefinitions).orderBy(desc(skillDefinitions.createdAt))).map(skillDefinitionDto))
+})
+app.post('/api/skills/library',async (req,res)=>{
+  const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  const definition=await resolveSkillDefinition(req.body)
+  if(!definition)return res.status(400).json({error:'skill_key_and_label_required'})
+  await db.insert(activityLogs).values({actor:'You',action:'skill.definition.created',targetType:'skill',targetId:definition.id,detail:`${definition.skillKey}@v${definition.version}`})
+  res.status(201).json(skillDefinitionDto(definition))
+})
+app.get('/api/agents/:id',async (req,res)=>{
+  const profile=await getAgentProfile(req.params.id)
+  if(!profile)return res.status(404).json({error:'agent_not_found'})
+  res.json(profile)
+})
+app.post('/api/agents/:id/skills/:slot/replace',async (req,res)=>{
+  const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  const [agent]=await db.select().from(agentsTable).where(eq(agentsTable.id,req.params.id)).limit(1)
+  if(!agent)return res.status(404).json({error:'agent_not_found'})
+  const slot=String(req.params.slot||'primary').trim().slice(0,80)||'primary'
+  const definition=await resolveSkillDefinition(req.body)
+  if(!definition)return res.status(400).json({error:'skill_definition_required'})
+  const [previous]=await db.select().from(agentSkillAssignments).where(and(eq(agentSkillAssignments.agentId,agent.id),eq(agentSkillAssignments.slot,slot),isNull(agentSkillAssignments.replacedAt))).limit(1)
+  if(previous)await db.update(agentSkillAssignments).set({enabled:false,replacedAt:new Date()}).where(eq(agentSkillAssignments.id,previous.id))
+  const [assignment]=await db.insert(agentSkillAssignments).values({agentId:agent.id,slot,skillDefinitionId:definition.id,enabled:req.body?.enabled!==false}).returning()
+  await db.insert(activityLogs).values({actor:'You',action:previous?'skill.replaced':'skill.assigned',targetType:'agent_skill',targetId:assignment.id,detail:`${agent.name}:${slot} -> ${definition.skillKey}@v${definition.version}`})
+  res.status(201).json(await getAgentProfile(agent.id))
+})
+app.patch('/api/agent-skills/:id',async (req,res)=>{
+  const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'})
+  if(typeof req.body?.enabled!=='boolean')return res.status(400).json({error:'enabled_boolean_required'})
+  const [updated]=await db.update(agentSkillAssignments).set({enabled:req.body.enabled}).where(and(eq(agentSkillAssignments.id,req.params.id),isNull(agentSkillAssignments.replacedAt))).returning()
+  if(!updated)return res.status(404).json({error:'active_assignment_not_found'})
+  await db.insert(activityLogs).values({actor:'You',action:req.body.enabled?'skill.enabled':'skill.disabled',targetType:'agent_skill',targetId:updated.id,detail:`${updated.agentId}:${updated.slot}`})
+  res.json(updated)
+})
 
 app.get('/api/tools/github', async (_req,res)=>{
   try { res.json(await fetchGitHubSnapshot()) }
@@ -174,10 +294,17 @@ app.post('/api/runs', async (req,res)=>{
   if(!agentId||!departmentId||!skill)return res.status(400).json({error:'agent_department_skill_required'})
   const [agent]=await db.select().from(agentsTable).where(eq(agentsTable.id,agentId)).limit(1)
   if(!agent||agent.departmentId!==departmentId)return res.status(404).json({error:'agent_not_found'})
-  if(!['github.repo-audit','operations.release-gate'].includes(skill))return res.status(400).json({error:'unsupported_skill'})
-  if(skill==='github.repo-audit' && agentId!=='e1')return res.status(403).json({error:'skill_not_allowed_for_agent'})
-  if(skill==='operations.release-gate' && agentId!=='o1')return res.status(403).json({error:'skill_not_allowed_for_agent'})
-  const [run]=await db.insert(agentRuns).values({agentId,departmentId,skill,status:'queued',input:input||null,taskId}).returning()
+  const [activeAssignments,definitions]=await Promise.all([
+    db.select().from(agentSkillAssignments).where(and(eq(agentSkillAssignments.agentId,agentId),isNull(agentSkillAssignments.replacedAt))),
+    db.select().from(skillDefinitions)
+  ])
+  const matched=activeAssignments.map(a=>({assignment:a,definition:definitions.find(d=>d.id===a.skillDefinitionId)})).find(x=>x.definition?.skillKey===skill)
+  if(!matched?.definition)return res.status(403).json({error:'skill_not_assigned'})
+  if(!matched.assignment.enabled)return res.status(409).json({error:'skill_disabled'})
+  if(matched.definition.status!=='ready'||!matched.definition.executable)return res.status(409).json({error:'skill_not_executable',status:matched.definition.status})
+  if(matched.definition.approvalRequired)return res.status(409).json({error:'skill_requires_approval'})
+  if(!knownSkillExecutors.has(skill))return res.status(400).json({error:'executor_not_available'})
+  const [run]=await db.insert(agentRuns).values({agentId,departmentId,skill,skillVersion:matched.definition.version,skillDefinitionId:matched.definition.id,skillAssignmentId:matched.assignment.id,status:'queued',input:input||null,taskId}).returning()
   await db.update(agentRuns).set({status:'running',startedAt:new Date()}).where(eq(agentRuns.id,run.id))
   await db.insert(activityLogs).values({actor:agent.name,action:'agent.run.started',targetType:'run',targetId:run.id,detail:skill})
   try {
@@ -264,7 +391,7 @@ app.post('/api/chat', async (req,res)=>{
 })
 
 async function boot() {
-  try { databaseReady=await ensureSchema(); if(databaseReady){await seedIfNeeded();databaseError=null} } catch(error) { databaseReady=false; databaseError=error instanceof Error?error.message:'database_boot_error'; console.error('Database boot failed, continuing in memory mode:',databaseError) }
+  try { databaseReady=await ensureSchema(); if(databaseReady){await seedIfNeeded();await seedSkillsIfNeeded();databaseError=null} } catch(error) { databaseReady=false; databaseError=error instanceof Error?error.message:'database_boot_error'; console.error('Database boot failed, continuing in memory mode:',databaseError) }
   const __dirname=path.dirname(fileURLToPath(import.meta.url)), dist=path.resolve(__dirname,'../dist')
   app.use(express.static(dist)); app.get('/*splat',(_req,res)=>res.sendFile(path.join(dist,'index.html'))); app.listen(port,'0.0.0.0',()=>console.log(`Agents Command Center listening on :${port} | persistence=${databaseReady?'postgres':'memory'} | model=${getModelStatus().configured?'configured':'fallback'}`))
 }

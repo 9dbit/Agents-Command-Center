@@ -1,5 +1,5 @@
 import { drizzle } from 'drizzle-orm/node-postgres'
-import { pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core'
+import { boolean, integer, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core'
 import { Pool } from 'pg'
 
 export const departments = pgTable('departments', {
@@ -18,11 +18,40 @@ export const agents = pgTable('agents', {
   task: text('task'),
 })
 
+export const skillDefinitions = pgTable('skill_definitions', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  skillKey: text('skill_key').notNull(),
+  version: integer('version').notNull().default(1),
+  label: text('label').notNull(),
+  description: text('description'),
+  tool: text('tool').notNull().default('Brain'),
+  status: text('status').notNull().default('draft'),
+  executable: boolean('executable').notNull().default(false),
+  approvalRequired: boolean('approval_required').notNull().default(false),
+  permissions: text('permissions').notNull().default('[]'),
+  inputSchema: text('input_schema').notNull().default('{}'),
+  outputSchema: text('output_schema').notNull().default('{}'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+})
+
+export const agentSkillAssignments = pgTable('agent_skill_assignments', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  agentId: text('agent_id').notNull(),
+  slot: text('slot').notNull().default('primary'),
+  skillDefinitionId: uuid('skill_definition_id').notNull(),
+  enabled: boolean('enabled').notNull().default(true),
+  assignedAt: timestamp('assigned_at', { withTimezone: true }).defaultNow().notNull(),
+  replacedAt: timestamp('replaced_at', { withTimezone: true }),
+})
+
 export const agentRuns = pgTable('agent_runs', {
   id: uuid('id').defaultRandom().primaryKey(),
   agentId: text('agent_id').notNull(),
   departmentId: text('department_id').notNull(),
   skill: text('skill').notNull(),
+  skillVersion: integer('skill_version'),
+  skillDefinitionId: uuid('skill_definition_id'),
+  skillAssignmentId: uuid('skill_assignment_id'),
   status: text('status').notNull().default('queued'),
   input: text('input'),
   output: text('output'),
@@ -140,11 +169,41 @@ export async function ensureSchema() {
       status text not null,
       task text
     );
+    create table if not exists skill_definitions (
+      id uuid primary key default gen_random_uuid(),
+      skill_key text not null,
+      version integer not null default 1,
+      label text not null,
+      description text,
+      tool text not null default 'Brain',
+      status text not null default 'draft',
+      executable boolean not null default false,
+      approval_required boolean not null default false,
+      permissions text not null default '[]',
+      input_schema text not null default '{}',
+      output_schema text not null default '{}',
+      created_at timestamptz not null default now(),
+      unique(skill_key, version)
+    );
+    create table if not exists agent_skill_assignments (
+      id uuid primary key default gen_random_uuid(),
+      agent_id text not null,
+      slot text not null default 'primary',
+      skill_definition_id uuid not null references skill_definitions(id),
+      enabled boolean not null default true,
+      assigned_at timestamptz not null default now(),
+      replaced_at timestamptz
+    );
+    create unique index if not exists agent_skill_active_slot_idx on agent_skill_assignments(agent_id, slot) where replaced_at is null;
+    create index if not exists agent_skill_agent_idx on agent_skill_assignments(agent_id, assigned_at desc);
     create table if not exists agent_runs (
       id uuid primary key default gen_random_uuid(),
       agent_id text not null,
       department_id text not null,
       skill text not null,
+      skill_version integer,
+      skill_definition_id uuid,
+      skill_assignment_id uuid,
       status text not null default 'queued',
       input text,
       output text,
@@ -153,6 +212,9 @@ export async function ensureSchema() {
       started_at timestamptz,
       completed_at timestamptz
     );
+    alter table agent_runs add column if not exists skill_version integer;
+    alter table agent_runs add column if not exists skill_definition_id uuid;
+    alter table agent_runs add column if not exists skill_assignment_id uuid;
     create index if not exists agent_runs_department_idx on agent_runs(department_id, created_at desc);
     create index if not exists agent_runs_agent_idx on agent_runs(agent_id, created_at desc);
     create table if not exists missions (
