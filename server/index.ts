@@ -97,12 +97,43 @@ async function getBrainContext(departmentId:string) {
   return rows.filter(item=>item.scope==='organization' || item.departmentId===departmentId).slice(0,20).map(item=>`[${item.type}] ${item.title}: ${item.content}`).join('\n')
 }
 
+async function upsertBrainSource(type:string,title:string,content:string,source:string) {
+  const db=readyDb(); if(!db) return null
+  const existing=await db.select().from(knowledgeItems).where(eq(knowledgeItems.source,source)).limit(1)
+  if(existing[0]) {
+    const [updated]=await db.update(knowledgeItems).set({type,title,content,updatedAt:new Date()}).where(eq(knowledgeItems.id,existing[0].id)).returning()
+    return updated
+  }
+  const [created]=await db.insert(knowledgeItems).values({type,title,content,scope:'organization',source}).returning()
+  return created
+}
+
+async function reconcileMission(missionId:string) {
+  const db=readyDb(); if(!db) return
+  const linked=await db.select().from(tasksTable).where(eq(tasksTable.missionId,missionId))
+  if(linked.length && linked.every(task=>task.status==='Done')) {
+    const [mission]=await db.update(missionsTable).set({status:'completed',updatedAt:new Date()}).where(eq(missionsTable.id,missionId)).returning()
+    if(mission) await db.insert(activityLogs).values({actor:'Mission Control',action:'mission.completed',targetType:'mission',targetId:missionId,detail:mission.title})
+  }
+}
+
+async function completeLinkedTask(taskId:string|null) {
+  if(!taskId) return
+  const db=readyDb(); if(!db) return
+  const [task]=await db.update(tasksTable).set({status:'Done',updatedAt:new Date()}).where(eq(tasksTable.id,taskId)).returning()
+  if(task?.missionId) await reconcileMission(task.missionId)
+}
+
 app.get('/api/health', async (_req,res)=>{
   const database = databaseReady ? 'connected' : (process.env.DATABASE_URL ? 'degraded' : 'not-configured')
   res.json({ok:true,service:'agents-command-center',version:'0.7.0',database,databaseError,persistence:databaseReady?'postgres':'memory',model:getModelStatus()})
 })
 app.get('/api/model/status',(_req,res)=>res.json(getModelStatus()))
 app.get('/api/tools/status',(_req,res)=>res.json(getToolStatus()))
+app.get('/api/skills',(_req,res)=>res.json([
+  {id:'github.repo-audit',agentId:'e1',departmentId:'engineering',agent:'Forge',label:'Repository Audit',tool:'GitHub'},
+  {id:'operations.release-gate',agentId:'o1',departmentId:'operations',agent:'Orion',label:'Production Release Gate',tool:'GitHub + Command Center'}
+]))
 
 app.get('/api/tools/github', async (_req,res)=>{
   try { res.json(await fetchGitHubSnapshot()) }
@@ -143,18 +174,27 @@ app.post('/api/runs', async (req,res)=>{
   if(!agentId||!departmentId||!skill)return res.status(400).json({error:'agent_department_skill_required'})
   const [agent]=await db.select().from(agentsTable).where(eq(agentsTable.id,agentId)).limit(1)
   if(!agent||agent.departmentId!==departmentId)return res.status(404).json({error:'agent_not_found'})
-  if(skill!=='github.repo-audit')return res.status(400).json({error:'unsupported_skill'})
+  if(!['github.repo-audit','operations.release-gate'].includes(skill))return res.status(400).json({error:'unsupported_skill'})
+  if(skill==='github.repo-audit' && agentId!=='e1')return res.status(403).json({error:'skill_not_allowed_for_agent'})
+  if(skill==='operations.release-gate' && agentId!=='o1')return res.status(403).json({error:'skill_not_allowed_for_agent'})
   const [run]=await db.insert(agentRuns).values({agentId,departmentId,skill,status:'queued',input:input||null,taskId}).returning()
   await db.update(agentRuns).set({status:'running',startedAt:new Date()}).where(eq(agentRuns.id,run.id))
   await db.insert(activityLogs).values({actor:agent.name,action:'agent.run.started',targetType:'run',targetId:run.id,detail:skill})
   try {
-    const snapshot=await fetchGitHubSnapshot()
-    const output=[`Repository ${snapshot.fullName} is ${snapshot.visibility} on ${snapshot.defaultBranch}.`,`${snapshot.commits.length} recent commits inspected; ${snapshot.openIssues} open issues reported by GitHub metadata.`,`Latest repository update: ${snapshot.updatedAt}.`,snapshot.commits[0]?`Latest commit: ${snapshot.commits[0].sha.slice(0,7)} ${snapshot.commits[0].message}.`:'No recent commit metadata returned.'].join(' ')
-    const source=`skill:github.repo-audit:${snapshot.repository}`
-    const existing=await db.select().from(knowledgeItems).where(eq(knowledgeItems.source,source)).limit(1)
-    if(existing[0]) await db.update(knowledgeItems).set({title:`Repository audit: ${snapshot.fullName}`,content:output,updatedAt:new Date()}).where(eq(knowledgeItems.id,existing[0].id))
-    else await db.insert(knowledgeItems).values({type:'analysis',title:`Repository audit: ${snapshot.fullName}`,content:output,scope:'organization',source})
-    if(taskId) await db.update(tasksTable).set({status:'Done',updatedAt:new Date()}).where(eq(tasksTable.id,taskId))
+    let output=''
+    if(skill==='github.repo-audit') {
+      const snapshot=await fetchGitHubSnapshot()
+      output=[`Repository ${snapshot.fullName} is ${snapshot.visibility} on ${snapshot.defaultBranch}.`,`${snapshot.commits.length} recent commits inspected; ${snapshot.openIssues} open issues reported by GitHub metadata.`,`Latest repository update: ${snapshot.updatedAt}.`,snapshot.commits[0]?`Latest commit: ${snapshot.commits[0].sha.slice(0,7)} ${snapshot.commits[0].message}.`:'No recent commit metadata returned.'].join(' ')
+      await upsertBrainSource('analysis',`Repository audit: ${snapshot.fullName}`,output,`skill:github.repo-audit:${snapshot.repository}`)
+    } else {
+      const [snapshot,state,approvalRows]=await Promise.all([fetchGitHubSnapshot(),readState(),db.select().from(approvalsTable)])
+      const pending=approvalRows.filter(a=>a.status==='pending').length
+      const blocked=state.tasks.filter(t=>t.status==='Waiting'||t.status==='Approval').length
+      const model=getModelStatus()
+      output=[`Release gate checked: PostgreSQL persistence is ${state.persistence}; GitHub repository ${snapshot.fullName} is reachable on ${snapshot.defaultBranch}.`,`${pending} pending approvals and ${blocked} blocked tasks remain as human-control warnings.`,`Model router is ${model.configured?'configured':'not configured'} for ${model.model}; deterministic orchestration remains available.`].join(' ')
+      await upsertBrainSource('analysis','Production release gate',output,'skill:operations.release-gate:production')
+    }
+    await completeLinkedTask(taskId)
     const [completed]=await db.update(agentRuns).set({status:'completed',output,completedAt:new Date()}).where(eq(agentRuns.id,run.id)).returning()
     await db.insert(activityLogs).values({actor:agent.name,action:'agent.run.completed',targetType:'run',targetId:run.id,detail:skill})
     return res.status(201).json(completed)
@@ -197,7 +237,7 @@ app.patch('/api/missions/:id', async (req,res)=>{
 
 app.get('/api/state', async (_req,res)=>{ try { res.json(await readState()) } catch(error) { res.status(500).json({error:error instanceof Error?error.message:'state_error'}) } })
 app.post('/api/tasks', async (req,res)=>{ const task={id:String(req.body?.id || `t-${Date.now()}`),title:String(req.body?.title || 'Untitled task').trim().slice(0,180),department:String(req.body?.department || 'Marketing'),status:String(req.body?.status || 'Inbox'),owner:String(req.body?.owner || 'Unassigned'),priority:String(req.body?.priority || 'Medium')}; const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'}); await db.insert(tasksTable).values(task); await db.insert(activityLogs).values({actor:'You',action:'task.created',targetType:'task',targetId:task.id,detail:task.title}); res.status(201).json(task) })
-app.patch('/api/tasks/:id', async (req,res)=>{ const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'}); const patch:any={updatedAt:new Date()}; for(const key of ['title','department','status','owner','priority'])if(req.body?.[key]!==undefined)patch[key]=String(req.body[key]); const [updated]=await db.update(tasksTable).set(patch).where(eq(tasksTable.id,req.params.id)).returning(); if(!updated)return res.status(404).json({error:'task_not_found'}); await db.insert(activityLogs).values({actor:'You',action:'task.updated',targetType:'task',targetId:req.params.id,detail:JSON.stringify(patch)}); res.json(updated) })
+app.patch('/api/tasks/:id', async (req,res)=>{ const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'}); const patch:any={updatedAt:new Date()}; for(const key of ['title','department','status','owner','priority'])if(req.body?.[key]!==undefined)patch[key]=String(req.body[key]); const [updated]=await db.update(tasksTable).set(patch).where(eq(tasksTable.id,req.params.id)).returning(); if(!updated)return res.status(404).json({error:'task_not_found'}); if(updated.missionId&&updated.status==='Done')await reconcileMission(updated.missionId); await db.insert(activityLogs).values({actor:'You',action:'task.updated',targetType:'task',targetId:req.params.id,detail:JSON.stringify(patch)}); res.json(updated) })
 app.delete('/api/tasks/:id', async (req,res)=>{ const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'}); const [deleted]=await db.delete(tasksTable).where(eq(tasksTable.id,req.params.id)).returning(); if(!deleted)return res.status(404).json({error:'task_not_found'}); await db.insert(activityLogs).values({actor:'You',action:'task.deleted',targetType:'task',targetId:req.params.id,detail:deleted.title}); res.json({ok:true,id:req.params.id}) })
 app.get('/api/approvals', async (_req,res)=>{ const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'}); res.json(await db.select().from(approvalsTable).orderBy(desc(approvalsTable.createdAt))) })
 app.patch('/api/approvals/:id', async (req,res)=>{ const db=readyDb(); if(!db)return res.status(503).json({error:'database_unavailable',mode:'memory'}); const status=String(req.body?.status||''); if(!['approved','rejected','pending'].includes(status))return res.status(400).json({error:'invalid_status'}); const [updated]=await db.update(approvalsTable).set({status,decidedBy:status==='pending'?null:'You',decidedAt:status==='pending'?null:new Date()}).where(eq(approvalsTable.id,req.params.id)).returning(); if(!updated)return res.status(404).json({error:'approval_not_found'}); await db.insert(activityLogs).values({actor:'You',action:`approval.${status}`,targetType:'approval',targetId:req.params.id,detail:updated.title}); res.json(updated) })
