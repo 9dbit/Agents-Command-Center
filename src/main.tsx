@@ -4,6 +4,7 @@ import App from './App'
 import AgentCapabilityOverlay from './AgentCapabilityOverlay'
 import './styles.css'
 import './mobile.css'
+import './redesign.css'
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode><App /><AgentCapabilityOverlay /></React.StrictMode>
